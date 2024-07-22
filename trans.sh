@@ -2600,6 +2600,18 @@ EOF
             done
         fi
 
+        # 16.04 arm64 镜像没有 grub 引导文件
+        if is_efi && ! [ -d $os_dir/boot/efi/EFI/ubuntu ]; then
+            DEBIAN_FRONTEND=noninteractive chroot $os_dir \
+                apt-get upgrade --reinstall -y efibootmgr shim "grub-efi-$(get_axx64)"
+
+            cat <<EOF >"$os_dir/boot/efi/EFI/ubuntu/grub.cfg"
+search.fs_uuid $os_part_uuid root
+set prefix=(\$root)'/boot/grub'
+configfile \$prefix/grub.cfg
+EOF
+        fi
+
         # 安装最佳内核
         flavor=$(get_ubuntu_kernel_flavor)
         echo "Use kernel flavor: $flavor"
@@ -3531,22 +3543,30 @@ get_ubuntu_kernel_flavor() {
     # http://git.annexia.org/?p=virt-what.git;a=blob;f=virt-what.in;hb=HEAD
     {
         # busybox blkid 不显示 sr0 的 UUID
-        apk add lsblk
-
-        if is_dmi_contains "amazon" || is_dmi_contains "ec2"; then
-            flavor=aws
-        elif is_dmi_contains "Google Compute Engine" || is_dmi_contains "GoogleCloud"; then
-            flavor=gcp
-        elif is_dmi_contains "OracleCloud"; then
-            flavor=oracle
-        elif is_dmi_contains "7783-7084-3265-9085-8269-3286-77"; then
-            flavor=azure
-        elif lsblk -o UUID,LABEL | grep -i 9796-932E | grep -i config-2; then
-            flavor=ibm
-        elif is_virt; then
-            flavor=virtual-hwe-$releasever
+        if [ "$releasever" = 16.04 ]; then
+            if is_virt; then
+                flavor=virtual-hwe-$releasever
+            else
+                flavor=generic-hwe-$releasever
+            fi
         else
-            flavor=generic-hwe-$releasever
+            apk add lsblk
+
+            if is_dmi_contains "amazon" || is_dmi_contains "ec2"; then
+                flavor=aws
+            elif is_dmi_contains "Google Compute Engine" || is_dmi_contains "GoogleCloud"; then
+                flavor=gcp
+            elif is_dmi_contains "OracleCloud"; then
+                flavor=oracle
+            elif is_dmi_contains "7783-7084-3265-9085-8269-3286-77"; then
+                flavor=azure
+            elif lsblk -o UUID,LABEL | grep -i 9796-932E | grep -i config-2; then
+                flavor=ibm
+            elif is_virt; then
+                flavor=virtual-hwe-$releasever
+            else
+                flavor=generic-hwe-$releasever
+            fi
         fi
     } >&2
     echo $flavor
