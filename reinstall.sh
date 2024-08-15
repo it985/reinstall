@@ -995,7 +995,7 @@ setos() {
         if is_in_china; then
             mirror=https://mirror.sjtu.edu.cn/opensuse
         else
-            mirror=https://mirror.fcix.net/opensuse
+            mirror=https://provo-mirror.opensuse.org
         fi
 
         if [ "$releasever" = tumbleweed ]; then
@@ -1044,11 +1044,11 @@ setos() {
             # od 在 coreutils 里面，好像要配合 tr 才能删除空格
             # hexdump 在 util-linux / bsdmainutils 里面
             # xxd 要单独安装，el 在 vim-common 里面
-            # xxd -l $((34 * 4096)) -ps -c 512
+            # xxd -l $((34 * 4096)) -ps -c 128
 
             # 仅打印前34个扇区 * 4096字节（按最大的算）
-            # 每行512字节
-            "$img_type" -dc <"$tmp/img-test" | hexdump -n $((34 * 4096)) -e '512/1 "%02x" "\n"' -v >$tmp/img-test-hex
+            # 每行128字节
+            "$img_type" -dc <"$tmp/img-test" | hexdump -n $((34 * 4096)) -e '128/1 "%02x" "\n"' -v >$tmp/img-test-hex
             if grep -q '^28732ac11ff8d211ba4b00a0c93ec93b' $tmp/img-test-hex; then
                 echo 'DD: Image is EFI.'
             else
@@ -1085,7 +1085,7 @@ Continue with DD?
                 "centos") ci_mirror="https://cloud.centos.org/centos" ;;
                 "alma") ci_mirror="https://repo.almalinux.org/almalinux/$releasever/cloud/$basearch/images" ;;
                 "rocky") ci_mirror="https://download.rockylinux.org/pub/rocky/$releasever/images/$basearch" ;;
-                "fedora") ci_mirror="https://download.fedoraproject.org/pub/fedora/linux/releases/$releasever/Cloud/$basearch/images" ;;
+                "fedora") ci_mirror="https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Cloud/$basearch/images" ;;
                 esac
             fi
             case $distro in
@@ -1918,8 +1918,25 @@ get_part_num_by_part() {
     grep -oE '[0-9]*$' <<<"$dev_part"
 }
 
+grep_efi_entry() {
+    # efibootmgr
+    # BootCurrent: 0002
+    # Timeout: 1 seconds
+    # BootOrder: 0000,0002,0003,0001
+    # Boot0000* sles-secureboot
+    # Boot0001* CD/DVD Rom
+    # Boot0002* Hard Disk
+    # Boot0003* sles-secureboot
+    # MirroredPercentageAbove4G: 0.00
+    # MirrorMemoryBelow4GB: false
+
+    # 根据文档，* 表示 active，也就是说有可能没有*(代表inactive)
+    # https://manpages.debian.org/testing/efibootmgr/efibootmgr.8.en.html
+    grep -E '^Boot[0-9a-fA-F]{4}'
+}
+
 grep_efi_index() {
-    awk -F '*' '{print $1}' | sed 's/Boot//'
+    awk '{print $1}' | sed -e 's/Boot//' -e 's/\*//'
 }
 
 add_efi_entry_in_linux() {
@@ -1955,7 +1972,7 @@ add_efi_entry_in_linux() {
                 --part "$(get_part_num_by_part $dev_part)" \
                 --label "$(get_entry_name)" \
                 --loader "\\EFI\\reinstall\\$basename" |
-                tail -1 | grep_efi_index)
+                grep_efi_entry | tail -1 | grep_efi_index)
             efibootmgr --bootnext $id
             return
         fi
@@ -1980,13 +1997,17 @@ install_grub_linux_efi() {
     # 因为 ipv6 访问有时跳转到 ipv4 地址，造成 ipv6 only 机器无法下载
     # 日韩机器有时得到国内镜像源，但镜像源屏蔽了国外 IP 导致连不上
     # https://mirrors.bfsu.edu.cn/opensuse/ports/aarch64/tumbleweed/repo/oss/EFI/BOOT/grub.efi
+
+    # fcix 经常 404
+    # https://mirror.fcix.net/opensuse/tumbleweed/repo/oss/EFI/BOOT/bootx64.efi
+    # https://mirror.fcix.net/opensuse/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.x86_64-Cloud.qcow2
     if [ "$efi_distro" = fedora ]; then
         fedora_ver=40
 
         if is_in_china; then
             mirror=https://mirrors.ustc.edu.cn/fedora
         else
-            mirror=https://mirror.fcix.net/fedora/linux
+            mirror=https://dl.fedoraproject.org/pub/fedora/linux
         fi
 
         curl -Lo $tmp/$grub_efi $mirror/releases/$fedora_ver/Everything/$basearch/os/EFI/BOOT/$grub_efi
@@ -1994,7 +2015,7 @@ install_grub_linux_efi() {
         if is_in_china; then
             mirror=https://mirror.sjtu.edu.cn/opensuse
         else
-            mirror=https://mirror.fcix.net/opensuse
+            mirror=https://provo-mirror.opensuse.org
         fi
 
         [ "$basearch" = x86_64 ] && ports='' || ports=/ports/$basearch
@@ -3007,7 +3028,7 @@ if is_efi; then
 
         install_pkg efibootmgr
         efibootmgr | grep -q 'BootNext:' && efibootmgr --quiet --delete-bootnext
-        efibootmgr | grep 'reinstall' | grep_efi_index |
+        efibootmgr | grep_efi_entry | grep 'reinstall' | grep_efi_index |
             xargs -I {} efibootmgr --quiet --bootnum {} --delete-bootnum
     fi
 fi
