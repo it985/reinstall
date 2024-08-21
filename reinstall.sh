@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# nixos 默认的配置不会生成 /bin/bash
 # shellcheck disable=SC2086
 
 set -eE
@@ -12,6 +13,9 @@ export LC_ALL=C
 # 处理部分用户用 su 切换成 root 导致环境变量没 sbin 目录
 # 不要漏了最后的 $PATH，否则会找不到 windows 系统程序例如 diskpart
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+
+# 记录日志
+exec > >(exec tee /reinstall.log) 2>&1
 
 this_script=$(readlink -f "$0")
 trap 'trap_err $LINENO $?' ERR
@@ -35,10 +39,11 @@ Usage: $reinstall____ centos      9
                       anolis      7|8
                       alma        8|9
                       rocky       8|9
-                      redhat      8|9   --img='http://xxx.qcow2'
+                      redhat      8|9   --img='http://xxx.com/xxx.qcow2'
                       opencloudos 8|9
                       oracle      7|8|9
                       fedora      39|40
+                      nixos       24.05
                       debian      9|10|11|12
                       openeuler   20.03|22.03|24.03
                       alpine      3.17|3.18|3.19|3.20
@@ -47,9 +52,10 @@ Usage: $reinstall____ centos      9
                       kali
                       arch
                       gentoo
-                      dd          --img='http://xxx.gzip' or .xz
-                      windows     --image-name='windows xxx yyy' --lang=xx-yy
-                      windows     --image-name='windows xxx yyy' --iso='http://xxx.iso'
+                      dd          --img='http://xxx.com/xxx.xz'
+                      dd          --img='http://xxx.com/xxx.gzip'
+                      windows     --image-name='windows xxx yyy'  --lang=xx-yy
+                      windows     --image-name='windows xxx yyy'  --iso='http://xxx.com/xxx.iso'
                       netboot.xyz
 
 Manual: https://github.com/bin456789/reinstall
@@ -234,6 +240,7 @@ test_url_real() {
 
     tmp_file=$tmp/img-test
 
+    # TODO: 好像无法识别 nixos 官方源的跳转
     # 有的服务器不支持 range，curl会下载整个文件
     # 用 dd 限制下载 1M
     # 并过滤 curl 23 错误（dd限制了空间）
@@ -745,7 +752,7 @@ setos() {
 
         # 不要用https 因为甲骨文云arm initramfs阶段不会从硬件同步时钟，导致访问https出错
         if is_in_china; then
-            mirror=http://mirrors.ustc.edu.cn/alpine/v$releasever
+            mirror=http://mirror.nju.edu.cn/alpine/v$releasever
         else
             mirror=http://dl-cdn.alpinelinux.org/alpine/v$releasever
         fi
@@ -768,7 +775,9 @@ setos() {
         esac
 
         if is_in_china; then
-            cdimage_mirror=https://mirrors.ustc.edu.cn/debian-cdimage
+            # 部分源没有 firmware
+            # https://mirror.nju.edu.cn/debian-cdimage/firmware/
+            cdimage_mirror=https://mirror.sjtu.edu.cn/debian-cdimage
         else
             cdimage_mirror=https://cdimage.debian.org/images # 在瑞典，不是 cdn
             # cloud.debian.org 同样在瑞典，不是 cdn
@@ -798,7 +807,7 @@ setos() {
                 if is_in_china; then
                     # ftp.cn.debian.org 不在国内还严重丢包
                     # https://www.itdog.cn/ping/ftp.cn.debian.org
-                    hostname=mirrors.ustc.edu.cn
+                    hostname=mirror.sjtu.edu.cn
                 else
                     hostname=deb.debian.org # fastly
                 fi
@@ -829,7 +838,7 @@ setos() {
         else
             # 传统安装
             if is_in_china; then
-                hostname=mirrors.ustc.edu.cn
+                hostname=mirror.nju.edu.cn
             else
                 # http.kali.org 没有 ipv6 地址
                 # http.kali.org (geoip 重定向) 到 kali.download (cf)
@@ -906,8 +915,8 @@ setos() {
             # 传统安装
             if is_in_china; then
                 case "$basearch" in
-                "x86_64") mirror=https://mirrors.ustc.edu.cn/ubuntu-releases/$releasever ;;
-                "aarch64") mirror=https://mirrors.ustc.edu.cn/ubuntu-cdimage/releases/$releasever/release ;;
+                "x86_64") mirror=https://mirror.nju.edu.cn/ubuntu-releases/$releasever ;;
+                "aarch64") mirror=https://mirror.nju.edu.cn/ubuntu-cdimage/releases/$releasever/release ;;
                 esac
             else
                 case "$basearch" in
@@ -931,13 +940,13 @@ setos() {
     setos_arch() {
         if [ "$basearch" = "x86_64" ]; then
             if is_in_china; then
-                mirror=https://mirrors.ustc.edu.cn/archlinux
+                mirror=https://mirror.nju.edu.cn/archlinux
             else
                 mirror=https://geo.mirror.pkgbuild.com # geoip
             fi
         else
             if is_in_china; then
-                mirror=https://mirrors.ustc.edu.cn/archlinuxarm
+                mirror=https://mirror.nju.edu.cn/archlinuxarm
             else
                 # https 证书有问题
                 mirror=http://mirror.archlinuxarm.org # geoip
@@ -958,9 +967,25 @@ setos() {
         fi
     }
 
+    setos_nixos() {
+        if is_in_china; then
+            mirror=https://mirror.nju.edu.cn/nix-channels
+        else
+            mirror=https://nixos.org/channels
+        fi
+
+        if is_use_cloud_image; then
+            :
+        else
+            # 传统安装
+            test_url $mirror/nixos-$releasever/store-paths.xz xz
+            eval ${step}_mirror=$mirror
+        fi
+    }
+
     setos_gentoo() {
         if is_in_china; then
-            mirror=https://mirrors.ustc.edu.cn/gentoo
+            mirror=https://mirror.nju.edu.cn/gentoo
         else
             mirror=https://distfiles.gentoo.org # cdn77
         fi
@@ -1040,6 +1065,10 @@ setos() {
 
         if is_efi; then
             install_pkg hexdump $img_type
+
+            # openwrt 镜像 efi part type 不是 esp
+            # 因此改成检测 fat?
+            # https://downloads.openwrt.org/releases/23.05.3/targets/x86/64/openwrt-23.05.3-x86-64-generic-ext4-combined-efi.img.gz
 
             # od 在 coreutils 里面，好像要配合 tr 才能删除空格
             # hexdump 在 util-linux / bsdmainutils 里面
@@ -1279,6 +1308,7 @@ verify_os_name() {
         'opencloudos 8|9' \
         'oracle      7|8|9' \
         'fedora      39|40' \
+        'nixos       24.05' \
         'debian      9|10|11|12' \
         'openeuler   20.03|22.03|24.03' \
         'alpine      3.17|3.18|3.19|3.20' \
@@ -1290,15 +1320,14 @@ verify_os_name() {
         'windows' \
         'dd' \
         'netboot.xyz'; do
-        ds=$(awk '{print $1}' <<<"$os")
-        vers=$(awk '{print $2}' <<<"$os" | sed 's \. \\\. g')
-        finalos=$(echo "$@" | to_lower | sed -n -E "s,^($ds)[ :-]?(|$vers)$,\1:\2,p")
+        read -r ds vers <<<"$os"
+        vers_=${vers//\./\\\.}
+        finalos=$(echo "$@" | to_lower | sed -n -E "s,^($ds)[ :-]?(|$vers_)$,\1 \2,p")
         if [ -n "$finalos" ]; then
-            distro=$(echo $finalos | cut -d: -f1)
-            releasever=$(echo $finalos | cut -d: -f2)
+            read -r distro releasever <<<"$finalos"
             # 默认版本号
-            if [ -z "$releasever" ] && grep -q '|' <<<$os; then
-                releasever=$(awk '{print $2}' <<<$os | awk -F'|' '{print $NF}')
+            if [ -z "$releasever" ] && [ -n "$vers" ]; then
+                releasever=$(awk -F '|' '{print $NF}' <<<"|$vers")
             fi
             return
         fi
@@ -1331,12 +1360,35 @@ install_pkg() {
     is_in_windows && return
 
     find_pkg_mgr() {
-        if [ -z "$pkg_mgr" ]; then
-            for mgr in dnf yum apt pacman zypper emerge apk; do
-                is_have_cmd $mgr && pkg_mgr=$mgr && return
+        [ -n "$pkg_mgr" ] && return
+
+        # 查找方法1: 通过 ID_LIKE / ID
+        # 因为可能装了多种包管理器
+        if [ -f /etc/os-release ]; then
+            # shellcheck source=/dev/null
+            . /etc/os-release
+            for id in $ID_LIKE $ID; do
+                # https://github.com/chef/os_release
+                case "$id" in
+                fedora | centos | rhel) is_have_cmd dnf && pkg_mgr=dnf || pkg_mgr=yum ;;
+                debian | ubuntu) pkg_mgr=apt ;;
+                opensuse | suse) pkg_mgr=zypper ;;
+                alpine) pkg_mgr=apk ;;
+                arch) pkg_mgr=pacman ;;
+                gentoo) pkg_mgr=emerge ;;
+                openwrt) pkg_mgr=opkg ;;
+                nixos) pkg_mgr=nix-env ;;
+                esac
+                [ -n "$pkg_mgr" ] && return
             done
-            return 1
         fi
+
+        # 查找方法 2
+        for mgr in dnf yum apt pacman zypper emerge apk opkg nix-env; do
+            is_have_cmd $mgr && pkg_mgr=$mgr && return
+        done
+
+        return 1
     }
 
     cmd_to_pkg() {
@@ -1458,6 +1510,15 @@ install_pkg() {
             [ -z "$apt_updated" ] && apt update && apt_updated=1
             DEBIAN_FRONTEND=noninteractive apt install -y $pkg
             ;;
+        opkg)
+            [ -z "$opkg_updated" ] && opkg update && opkg_updated=1
+            opkg install $pkg
+            ;;
+        nix-env)
+            # 不指定 channel 会很慢，而且很占内存
+            [ -z "$nix_updated" ] && nix-channel --update && nix_updated=1
+            nix-env -iA nixos.$pkg
+            ;;
         esac
     }
 
@@ -1499,7 +1560,7 @@ check_ram() {
         case "$distro" in
         netboot.xyz) echo 0 ;;
         alpine | debian | kali | dd) echo 256 ;;
-        arch | gentoo | windows) echo 512 ;;
+        arch | gentoo | nixos | windows) echo 512 ;;
         redhat | centos | alma | rocky | fedora | oracle | ubuntu | anolis | opencloudos | openeuler) echo 1024 ;;
         opensuse) echo -1 ;; # 没有安装模式
         esac
@@ -1516,7 +1577,7 @@ check_ram() {
     has_cloud_image=$(
         case "$distro" in
         redhat | centos | alma | rocky | oracle | fedora | debian | ubuntu | opensuse | anolis | openeuler) echo true ;;
-        netboot.xyz | alpine | dd | arch | gentoo | kali | windows) echo false ;;
+        netboot.xyz | alpine | dd | arch | gentoo | nixos | kali | windows) echo false ;;
         esac
     )
 
@@ -2005,7 +2066,7 @@ install_grub_linux_efi() {
         fedora_ver=40
 
         if is_in_china; then
-            mirror=https://mirrors.ustc.edu.cn/fedora
+            mirror=https://mirror.nju.edu.cn/fedora
         else
             mirror=https://dl.fedoraproject.org/pub/fedora/linux
         fi
@@ -2032,7 +2093,7 @@ install_grub_win() {
     grub_ver=2.06
     # ftpmirror.gnu.org 是 geoip 重定向，不是 cdn
     # 有可能重定义到一个拉黑了部分 IP 的服务器
-    is_in_china && grub_url=https://mirrors.ustc.edu.cn/gnu/grub/grub-$grub_ver-for-windows.zip ||
+    is_in_china && grub_url=https://mirror.nju.edu.cn/gnu/grub/grub-$grub_ver-for-windows.zip ||
         grub_url=https://ftpmirror.gnu.org/gnu/grub/grub-$grub_ver-for-windows.zip
     curl -Lo $tmp/grub.zip $grub_url
     # unzip -qo $tmp/grub.zip
@@ -2060,7 +2121,7 @@ install_grub_win() {
         if [ "$basearch" = aarch64 ]; then
             # 3.20 是 grub 2.12，可能会有问题
             alpine_ver=3.19
-            is_in_china && mirror=http://mirrors.ustc.edu.cn/alpine || mirror=https://dl-cdn.alpinelinux.org/alpine
+            is_in_china && mirror=http://mirror.nju.edu.cn/alpine || mirror=https://dl-cdn.alpinelinux.org/alpine
             grub_efi_apk=$(curl -L $mirror/v$alpine_ver/main/aarch64/ | grep -oP 'grub-efi-.*?apk' | head -1)
             mkdir -p $tmp/grub-efi
             curl -L "$mirror/v$alpine_ver/main/aarch64/$grub_efi_apk" | tar xz --warning=no-unknown-keyword -C $tmp/grub-efi/
@@ -2082,7 +2143,7 @@ install_grub_win() {
         if false; then
             # g2ldr.mbr
             # 部分国内机无法访问 ftp.cn.debian.org
-            is_in_china && host=mirrors.ustc.edu.cn || host=deb.debian.org
+            is_in_china && host=mirror.nju.edu.cn || host=deb.debian.org
             curl -LO http://$host/debian/tools/win32-loader/stable/win32-loader.exe
             7z x win32-loader.exe 'g2ldr.mbr' -o$tmp/win32-loader -r -y -bso0
             find $tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
@@ -2157,7 +2218,14 @@ build_extra_cmdline() {
 }
 
 echo_tmp_ttys() {
-    curl -L $confhome/ttys.sh | sh -s "console="
+    if false; then
+        curl -L $confhome/ttys.sh | sh -s "console="
+    else
+        case "$basearch" in
+        x86_64) echo "console=ttyS0,115200n8 console=tty0" ;;
+        aarch64) echo "console=ttyS0,115200n8 console=ttyAMA0,115200n8 console=tty0" ;;
+        esac
+    fi
 }
 
 get_entry_name() {
@@ -2200,11 +2268,10 @@ build_nextos_cmdline() {
         else
             # debian arm 在没有ttyAMA0的机器上（aws t4g），最少要设置一个tty才能启动
             # 只设置tty0也行，但安装过程ttyS0没有显示
-            nextos_cmdline+=" console=ttyAMA0,115200 console=ttyS0,115200 console=tty0"
+            nextos_cmdline+=" $(echo_tmp_ttys)"
         fi
     else
-        # nextos_cmdline+=" $(echo_tmp_ttys)"
-        nextos_cmdline+=" console=ttyAMA0,115200 console=ttyS0,115200 console=tty0"
+        nextos_cmdline+=" $(echo_tmp_ttys)"
     fi
     # nextos_cmdline+=" mem=256M"
     # nextos_cmdline+=" lowmem=+1"
@@ -2250,9 +2317,9 @@ mod_initrd_debian_kali() {
 
     # hack 2
     # 修改 /var/lib/dpkg/info/netcfg.postinst 运行我们的脚本
-    # shellcheck disable=SC1091,SC2317
     netcfg() {
         #!/bin/sh
+        # shellcheck source=/dev/null
         . /usr/share/debconf/confmodule
         db_progress START 0 5 debian-installer/netcfg/title
 
@@ -2923,7 +2990,7 @@ mkdir_clear "$tmp"
 # 强制忽略/强制添加 --ci 参数
 # debian 不强制忽略 ci 留作测试
 case "$distro" in
-dd | windows | netboot.xyz | kali | alpine | arch | gentoo)
+dd | windows | netboot.xyz | kali | alpine | arch | gentoo | nixos)
     if is_use_cloud_image; then
         echo "ignored --ci"
         cloud_image=0
@@ -3024,7 +3091,10 @@ if is_efi; then
             xargs -I {} cmd /c bcdedit /delete {}
     else
         # shellcheck disable=SC2046
-        find $(get_maybe_efi_dirs_in_linux) /boot -type f -name 'custom.cfg' -exec rm -f {} \;
+        # 如果 nixos 的 efi 挂载到 /efi，则不会生成 /boot 文件夹
+        # find 不存在的路径会报错退出
+        find $(get_maybe_efi_dirs_in_linux) $([ -d /boot ] && echo /boot) \
+            -type f -name 'custom.cfg' -exec rm -f {} \;
 
         install_pkg efibootmgr
         efibootmgr | grep -q 'BootNext:' && efibootmgr --quiet --delete-bootnext
@@ -3154,7 +3224,21 @@ if is_use_grub; then
         else
             error_and_exit "grub not found"
         fi
-        $grub-mkconfig -o $grub_cfg
+
+        # nixos 手动执行 grub-mkconfig -o /boot/grub/grub.cfg 会丢失系统启动条目
+        # 正确的方法是修改 configuration.nix 的 boot.loader.grub.extraEntries
+        # 但是修改 configuration.nix 不是很好，因此改成修改 grub.cfg
+        if [ -x /nix/var/nix/profiles/system/bin/switch-to-configuration ]; then
+            # 生成 grub.cfg
+            /nix/var/nix/profiles/system/bin/switch-to-configuration boot
+            # 手动启用 41_custom
+            nixos_grub_home="$(dirname "$(readlink -f "$(get_cmd_path grub-mkconfig)")")/.."
+            $nixos_grub_home/etc/grub.d/41_custom >>$grub_cfg
+        elif is_have_cmd update-grub; then
+            update-grub
+        else
+            $grub-mkconfig -o $grub_cfg
+        fi
     fi
 
     # 选择用 custom.cfg (linux-bios) 还是 grub.cfg (win/linux-efi)

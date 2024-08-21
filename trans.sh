@@ -3,38 +3,15 @@
 # shellcheck disable=SC2086,SC3047,SC3036,SC3010,SC3001
 # alpine 默认使用 busybox ash
 
-# 命令出错终止运行，将进入到登录界面，防止失联
+# 出错后停止运行，将进入到登录界面，防止失联
 set -eE
 
-# debian 安装版、ubuntu 安装版、redhat 安装版不使用该密码
+# debian 安装版、ubuntu 安装版、el/ol 安装版不使用该密码
 PASSWORD=123@@@
-EFI_UUID=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 
 TRUE=0
 FALSE=1
-
-trap 'trap_err $LINENO $?' ERR
-
-# 复制本脚本到 /tmp/trans.sh，用于打印错误
-# 也有可能从管道运行，这时删除 /tmp/trans.sh
-case "$0" in
-*trans.*) cp -f "$0" /tmp/trans.sh ;;
-*) rm -f /tmp/trans.sh ;;
-esac
-
-# 还原改动，不然本脚本会被复制到新系统
-rm -f /etc/local.d/trans.start
-rm -f /etc/runlevels/default/local
-
-trap_err() {
-    line_no=$1
-    ret_no=$2
-
-    error "Line $line_no return $ret_no"
-    if [ -f "/tmp/trans.sh" ]; then
-        sed -n "$line_no"p /tmp/trans.sh
-    fi
-}
+EFI_UUID=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 
 error() {
     color='\e[31m'
@@ -45,6 +22,20 @@ error() {
 error_and_exit() {
     error "$@"
     exit 1
+}
+
+trap_err() {
+    line_no=$1
+    ret_no=$2
+
+    error "Line $line_no return $ret_no"
+    if [ -f "/trans.sh" ]; then
+        sed -n "$line_no"p /trans.sh
+    fi
+}
+
+is_run_from_locald() {
+    [[ "$0" = "/etc/local.d/*" ]]
 }
 
 add_community_repo() {
@@ -305,13 +296,6 @@ get_all_disks() {
     ls /sys/block/ | grep -Ev '^(loop|sr|nbd)'
 }
 
-setup_tty_and_log() {
-    # 显示输出到前台
-    # script -f /dev/tty0
-    dev_ttys=$(get_ttys /dev/)
-    exec > >(tee -a $dev_ttys /reinstall.log) 2>&1
-}
-
 extract_env_from_cmdline() {
     # 提取 finalos/extra 到变量
     for prefix in finalos extra; do
@@ -323,6 +307,14 @@ extract_env_from_cmdline() {
             fi
         done < <(xargs -n1 </proc/cmdline | grep "^${prefix}_" | sed "s/^${prefix}_//")
     done
+}
+
+ensure_modloop_started() {
+    if ! rc-service modloop status; then
+        if ! retry 5 rc-service modloop start; then
+            error_and_exit "modloop failed to start."
+        fi
+    fi
 }
 
 mod_motd() {
@@ -344,7 +336,7 @@ EOF
 }
 
 umount_all() {
-    dirs="/mnt /os /iso /wim /installer /nbd /nbd-boot /nbd-efi /root"
+    dirs="/mnt /os /iso /wim /installer /nbd /nbd-boot /nbd-efi /root /nix"
     regex=$(echo "$dirs" | sed 's, ,|,g')
     if mounts=$(mount | grep -Ew "$regex" | awk '{print $3}' | tac); then
         for mount in $mounts; do
@@ -363,6 +355,7 @@ clear_previous() {
         dmsetup remove_all
     fi
     disconnect_qcow
+    rc-service --ifexists --ifstarted nix-daemon stop
     swapoff -a
     umount_all
 
@@ -427,9 +420,7 @@ is_ipv4_has_internet() {
 }
 
 is_in_china() {
-    get_netconf_to is_in_china
-    # shellcheck disable=SC2154
-    [ "$is_in_china" = 1 ]
+    grep -q 1 /dev/netconf/*/is_in_china
 }
 
 # 有 dhcpv4 不等于有网关，例如 vultr 纯 ipv6
@@ -544,23 +535,19 @@ is_need_manual_set_dnsv6() {
         { ! is_have_rdnss || { is_have_rdnss && is_windows && ! is_windows_support_rdnss; }; }
 }
 
-get_current_dns_v4() {
+get_current_dns() {
+    mark=$(
+        case "$1" in
+        4) echo . ;;
+        6) echo : ;;
+        esac
+    )
     # debian 11 initrd 没有 xargs awk
     # debian 12 initrd 没有 xargs
     if false; then
-        grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep '\.'
+        grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep -F "$mark"
     else
-        grep '^nameserver' /etc/resolv.conf | cut -d' ' -f2 | grep '\.'
-    fi
-}
-
-get_current_dns_v6() {
-    # debian 11 initrd 没有 xargs awk
-    # debian 12 initrd 没有 xargs
-    if false; then
-        grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep ':'
-    else
-        grep '^nameserver' /etc/resolv.conf | cut -d' ' -f2 | grep ':'
+        grep '^nameserver' /etc/resolv.conf | cut -d' ' -f2 | grep -F "$mark"
     fi
 }
 
@@ -679,13 +666,19 @@ insert_into_file() {
     file=$1
     location=$2
     regex_to_find=$3
+    shift 3
+
+    # 默认 grep -E
+    if [ $# -eq 0 ]; then
+        set -- -E
+    fi
 
     if [ "$location" = head ]; then
         bak=$(mktemp)
         cp $file $bak
         cat - $bak >$file
     else
-        line_num=$(grep -E -n "$regex_to_find" "$file" | cut -d: -f1)
+        line_num=$(grep "$@" -n "$regex_to_find" "$file" | cut -d: -f1)
 
         found_count=$(echo "$line_num" | wc -l)
         if [ ! "$found_count" -eq 1 ]; then
@@ -773,7 +766,7 @@ iface $ethx inet static
     gateway $ipv4_gateway
 EOF
             # dns
-            if list=$(get_current_dns_v4); then
+            if list=$(get_current_dns 4); then
                 for dns in $list; do
                     cat <<EOF >>$conf_file
     dns-nameservers $dns
@@ -801,8 +794,8 @@ EOF
 
         # dns
         # 有 ipv6 但需设置 dns 的情况
-        if is_need_manual_set_dnsv6 && list=$(get_current_dns_v6); then
-            for dns in $list; do
+        if is_need_manual_set_dnsv6; then
+            for dns in $(get_current_dns 6); do
                 cat <<EOF >>$conf_file
     dns-nameserver $dns
 EOF
@@ -822,6 +815,164 @@ EOF
             fi
         fi
     done
+}
+
+space_to_newline() {
+    sed 's/ /\n/g'
+}
+
+trim() {
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+quote_word() {
+    sed -E 's/([^[:space:]]+)/"\1"/g'
+}
+
+quote_line() {
+    awk '{print "\""$0"\""}'
+}
+
+add_space() {
+    space_count=$1
+
+    spaces=$(printf '%*s' "$space_count" '')
+    sed "s/^/$spaces/"
+}
+
+# 不够严谨，谨慎使用
+nix_replace() {
+    local key=$1
+    local value=$2
+    local type=$3
+    local file=$4
+    local key_ value_
+
+    key_=$(echo "$key" | sed 's \. \\\. g') # . 改成 \.
+
+    if [ "$type" = array ]; then
+        local value_="[ $value ]"
+    fi
+
+    sed -i "s/$key_ =.*/$key = $value_;/" "$file"
+}
+
+create_nixos_network_config() {
+    conf_file=$1
+    true >$conf_file
+
+    # 头部
+    cat <<EOF >>$conf_file
+networking = {
+  usePredictableInterfaceNames = false;
+EOF
+
+    for ethx in $(get_eths); do
+        # ipv4
+        if is_staticv4; then
+            get_netconf_to ipv4_addr
+            get_netconf_to ipv4_gateway
+            IFS=/ read -r address prefix < <(echo "$ipv4_addr")
+            cat <<EOF >>$conf_file
+  interfaces.$ethx.ipv4.addresses = [
+    {
+      address = "$address";
+      prefixLength = $prefix;
+    }
+  ];
+  defaultGateway = {
+    address = "$ipv4_gateway";
+    interface = "$ethx";
+  };
+EOF
+        fi
+
+        # ipv6
+        if is_staticv6; then
+            get_netconf_to ipv6_addr
+            get_netconf_to ipv6_gateway
+            IFS=/ read -r address prefix < <(echo "$ipv6_addr")
+            cat <<EOF >>$conf_file
+  interfaces.$ethx.ipv6.addresses = [
+    {
+      address = "$address";
+      prefixLength = $prefix;
+    }
+  ];
+  defaultGateway6 = {
+    address = "$ipv6_gateway";
+    interface = "$ethx";
+  };
+EOF
+        fi
+    done
+
+    # 全局 dns
+    need_set_dns=false
+    for ethx in $(get_eths); do
+        if is_staticv4 || is_staticv6 || is_need_manual_set_dnsv6; then
+            need_set_dns=true
+            break
+        fi
+    done
+
+    if $need_set_dns; then
+        cat <<EOF >>$conf_file
+  nameservers = [
+$(get_current_dns | quote_line | add_space 4)
+  ];
+EOF
+    fi
+
+    # 尾部
+    cat <<EOF >>$conf_file
+};
+EOF
+
+    # nixos 默认网络管理器是 dhcpcd
+    # 但配置静态 ip 时用的是脚本
+    # /nix/store/qcr1xxjdxcrnwqwrgysqpxx2aibp9fdl-unit-script-network-addresses-eth0-start/bin/network-addresses-eth0-start
+    # ...
+    # if out=$(ip addr replace "181.x.x.x/24" dev "eth0" 2>&1); then
+    #   echo "done"
+    # else
+    #   echo "'ip addr replace "181.x.x.x/24" dev "eth0"' failed: $out"
+    #   exit 1
+    # fi
+    # ...
+
+    # 禁用 ra
+    for ethx in $(get_eths); do
+        if should_disable_ra_slaac; then
+            mode=1
+            if [ "$mode" = 1 ]; then
+                cat <<EOF >>$conf_file
+boot.kernel.sysctl."net.ipv6.conf.$ethx.accept_ra" = false;
+EOF
+            elif [ "$mode" = 2 ]; then
+                # nixos 配置静态 ip 时用的是脚本
+                # 好像因此不起作用
+                cat <<EOF >>$conf_file
+networking.dhcpcd.extraConfig =
+  ''
+    interface $ethx
+      ipv6ra_noautoconf
+  '';
+EOF
+            elif [ "$mode" = 3 ]; then
+                # 暂时没用到 networkd
+                cat <<EOF >>$conf_file
+systemd.network.networks.$ethx = {
+   matchConfig.Name = "$ethx";
+   networkConfig = {
+     IPv6AcceptRA = false;
+   };
+ };
+EOF
+            fi
+        fi
+    done
+
 }
 
 install_alpine() {
@@ -848,21 +999,7 @@ install_alpine() {
     # bios机器用 setup-disk 自动分区会有 boot 分区
     # 因此手动分区安装
     create_part
-
-    # 挂载系统分区
-    if is_efi || is_xda_gt_2t; then
-        os_part_num=2
-    else
-        os_part_num=1
-    fi
-    mkdir -p /os
-    mount -t ext4 /dev/${xda}*${os_part_num} /os
-
-    # 挂载 efi
-    if is_efi; then
-        mkdir -p /os/boot/efi
-        mount -t vfat /dev/${xda}*1 /os/boot/efi
-    fi
+    mount_part_basic_layout /os /os/boot/efi
 
     # 创建 swap
     if $hack_lowram_swap; then
@@ -989,6 +1126,207 @@ get_cpu_vendor() {
     esac
 }
 
+min() {
+    printf "%d\n" "$@" | sort -n | head -n 1
+}
+
+# 设置线程
+# 根据 cpu 核数，每个线程的内存，取最小值
+get_build_threads() {
+    threads_per_mb=$1
+
+    threads_by_core=$(nproc --all)
+    threads_by_ram=$(($(get_approximate_ram_size) / threads_per_mb))
+    [ $threads_by_ram -eq 0 ] && threads_by_ram=1
+    min $threads_by_ram $threads_by_core
+}
+
+add_newline() {
+    # shellcheck disable=SC1003
+    case "$1" in
+    head | start) sed -e '1s/^/\n/' ;;
+    tail | end) sed -e '$a\\' ;;
+    both) sed -e '1s/^/\n/' -e '$a\\' ;;
+    esac
+}
+
+install_nixos() {
+    os_dir=/os
+    keep_swap=true
+
+    show_nixos_config() {
+        echo
+        cat -n /os/etc/nixos/configuration.nix
+        echo
+        cat -n /os/etc/nixos/hardware-configuration.nix
+        echo
+    }
+
+    # 挂载分区，创建 swapfile
+    mount_part_basic_layout /os /os/efi
+    need_ram=2048
+    swap_size=$(get_need_swap_size $need_ram)
+    create_swap_if_ram_less_than $need_ram /os/swapfile
+
+    # 步骤
+    # 1. 安装 nix (nix-xxx)
+    # 2. 用 nix 安装 nixos-install-tools (nixos-xxx)
+    # 3. 运行 nixos-generate-config 生成配置 + 编辑
+    # 4. 运行 nixos-install
+
+    # nix 安装方式                                    分支          版本
+    # apk add nix                                    3.20         2.22.0   #  nix 本体跟正常的软件一样，不在 /nix/store 里面
+    # env -iA nixpkgs.nix                            24.05        2.18.5
+    # sh <(curl -L https://nixos.org/nix/install)   unstable?     2.24.2
+
+    # 安装 nix
+    mkdir -p /os/nix /nix
+    mount --bind /os/nix /nix
+    apk add nix
+
+    # TODO: 有时安装系统时会出错，卡在
+    # copying path '/nix/store/gcbrjlfm5h21ybf1h2lfq773zafjmzjr-curl-8.7.1-man' from 'https://cache.nixos.org'...
+    # 但是 cpu 空载
+
+    # 设置 nix 镜像和线程
+    # alpine 默认设置了 4 线程
+    # https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/nix/APKBUILD#L125
+    sed -i '/max-jobs/d' /etc/nix/nix.conf
+    echo "max-jobs = $(get_build_threads 2048)" >>/etc/nix/nix.conf
+    if is_in_china; then
+        echo "substituters = $mirror/store" >>/etc/nix/nix.conf
+    fi
+    rc-service nix-daemon restart
+
+    # 添加 channel
+    # shellcheck disable=SC2154
+    nix-channel --add $mirror/nixos-$releasever nixpkgs
+    nix-channel --update
+
+    # 安装 channal 的 nix
+    # shellcheck source=/dev/null
+    if false; then
+        nix-env -iA nixpkgs.nix
+        . ~/.nix-profile/etc/profile.d/nix.sh
+    fi
+
+    # 安装 nixos-install-tools
+    nix-env -iA nixpkgs.nixos-install-tools
+
+    # 添加 nix-env 安装的软件到 PATH
+    PATH="/root/.nix-profile/bin:$PATH"
+
+    # 生成配置并显示
+    nixos-generate-config --root /os
+    echo "Original NixOS Configuration:"
+    show_nixos_config
+
+    # 修改 configuration.nix
+    if is_efi; then
+        nix_bootloader="boot.loader.efi.efiSysMountPoint = \"/efi\";"
+    else
+        nix_bootloader="boot.loader.grub.device = \"/dev/$xda\";"
+    fi
+
+    if is_in_china; then
+        nix_substituters="nix.settings.substituters = lib.mkForce [ \"$mirror/store\" ];"
+    fi
+
+    if [ -e /os/swapfile ] && $keep_swap; then
+        nix_swap="swapDevices = [{ device = \"/swapfile\"; size = $swap_size; }];"
+    fi
+
+    # TODO: 准确匹配网卡，添加 udev 或者直接配置 networkd 匹配 mac
+    create_nixos_network_config /tmp/nixos_network_config.nix
+
+    cat <<EOF |
+############### Add by reinstall.sh ###############
+$nix_bootloader
+$nix_swap
+$nix_substituters
+boot.kernelParams = [ $(get_ttys console= | quote_word) ];
+services.openssh.enable = true;
+services.openssh.settings.PermitRootLogin = "yes";
+$(cat /tmp/nixos_network_config.nix)
+###################################################
+EOF
+        add_space 2 | del_empty_lines | add_newline both |
+        insert_into_file /os/etc/nixos/configuration.nix before "networking.hostName" -F
+
+    # 修改 hardware-configuration.nix
+    # 在 vultr efi 机器上，nixos-generate-config 不会添加 virtio_pci
+    # 导致 virtio_blk 用不了，启动时 initrd 找不到系统分区
+    # 可能由于 alpine 的 virtio_pci 编译进内核而不是模块
+    # 因此 nixos-generate-config 不会添加 virtio_pci 到配置文件
+    olds=$(
+        grep -F 'boot.initrd.availableKernelModules' /os/etc/nixos/hardware-configuration.nix |
+            cut -d= -f2 | tr -d '"[];' | xargs
+    )
+    alls="$olds"
+    # https://github.com/search?q=repo%3ANixOS%2Fnixpkgs+availableKernelModules&type=code
+    for mod in ahci ata_piix uhci_hcd sr_mod nvme \
+        virtio_pci virtio_blk virtio_scsi \
+        xen_blkfront xen_scsifront \
+        hv_storvsc \
+        vmw_pvscsi \
+        mptspi; do
+        if [ -d /sys/module/$mod ] && ! echo "$olds" | grep -wq "$mod"; then
+            echo "Adding modules: $mod"
+            alls="$alls $mod"
+        fi
+    done
+    # 去除多余的空格
+    alls=$(echo "$alls" | xargs)
+
+    # boot.initrd.availableKernelModules = [ "ata_piix" "uhci_hcd" "virtio_pci" "sr_mod" "virtio_blk" ];
+    nix_replace \
+        boot.initrd.availableKernelModules \
+        "$(echo "$alls" | quote_word)" \
+        array \
+        /os/etc/nixos/hardware-configuration.nix
+
+    # 显示修改后的配置
+    echo "Modified NixOS Configuration:"
+    show_nixos_config
+
+    # 安装系统
+    nixos-install --root /os --no-root-passwd -j "$(get_build_threads 2048)"
+
+    # 设置密码
+    echo "root:$PASSWORD" | nixos-enter --root /os -- \
+        /run/current-system/sw/bin/chpasswd
+
+    # 设置 channel
+    if is_in_china; then
+        nixos-enter --root /os -- \
+            /run/current-system/sw/bin/nix-channel \
+            --add https://mirrors.cernet.edu.cn/nix-channels/nixos-$releasever nixos
+    fi
+
+    # 清理
+    nix-env -e '*'
+    # /nix/var/nix/profiles/system/sw/bin/nix-collect-garbage -d
+    /nix/var/nix/profiles/system/sw/bin/nixos-enter --root /os -- \
+        /run/current-system/sw/bin/nix-collect-garbage -d
+
+    # 删除 nix
+    umount /nix
+    apk del nix
+
+    # swapfile
+    if [ -e /os/swapfile ]; then
+        if $keep_swap; then
+            :
+        else
+            swapoff -a
+            rm -rf /os/swapfile
+        fi
+    fi
+
+    # 重新显示配置，方便查看
+    show_nixos_config
+}
+
 install_arch_gentoo() {
     set_locale() {
         echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
@@ -1106,21 +1444,12 @@ EOF
 ACCEPT_LICENSE="*"
 EOF
 
-        # 设置线程
-        # 根据 cpu 核数，2G内存一个线程，取最小值
-        threads_by_core=$(nproc --all)
-        phy_ram=$(get_approximate_ram_size)
-        threads_by_ram=$((phy_ram / 2048))
-        if [ $threads_by_ram -eq 0 ]; then
-            threads_by_ram=1
-        fi
-        threads=$(printf "%d\n" $threads_by_ram $threads_by_core | sort -n | head -1)
         cat <<EOF >>$os_dir/etc/portage/make.conf
-MAKEOPTS="-j$threads"
+MAKEOPTS="-j$(get_build_threads 2048)"
 EOF
 
         # 设置 http repo + binpkg repo
-        # https://mirrors.ustc.edu.cn/gentoo/releases/amd64/autobuilds/current-stage3-amd64-systemd-mergedusr/stage3-amd64-systemd-mergedusr-20240317T170433Z.tar.xz
+        # https://mirror.nju.edu.cn/gentoo/releases/amd64/autobuilds/current-stage3-amd64-systemd-mergedusr/stage3-amd64-systemd-mergedusr-20240317T170433Z.tar.xz
         mirror_short=$(echo "$img" | sed 's,/releases/.*,,')
         mirror_long=$(echo "$img" | sed 's,/autobuilds/.*,,')
         profile_ver=$(chroot $os_dir eselect profile show | grep -Eo '/[0-9.]*/' | cut -d/ -f2)
@@ -1157,7 +1486,7 @@ EOF
 
         # 设置 git repo
         if is_in_china; then
-            git_uri=https://mirrors.ustc.edu.cn/gentoo.git
+            git_uri=https://mirror.nju.edu.cn/git/gentoo-portage.git
         else
             # github 不支持 ipv6
             is_ipv4_has_internet && git_uri=https://github.com/gentoo-mirror/gentoo.git ||
@@ -1204,20 +1533,9 @@ EOF
     os_dir=/os
 
     # 挂载分区
-    if is_efi || is_xda_gt_2t; then
-        os_part_num=2
-    else
-        os_part_num=1
-    fi
+    mount_part_basic_layout /os /os/efi
 
-    mkdir -p /os
-    mount -t ext4 /dev/${xda}*${os_part_num} /os
-
-    if is_efi; then
-        mkdir -p /os/efi
-        mount -t vfat /dev/${xda}*1 /os/efi
-    fi
-
+    # 安装系统
     install_$distro
 
     # 初始化
@@ -1465,7 +1783,7 @@ create_part() {
             mkfs.ext4 -E nodiscard -F -L os /dev/$xda*1        #1 os
             mkfs.ext4 -E nodiscard -F -L installer /dev/$xda*2 #2 installer
         fi
-    elif [ "$distro" = alpine ] || [ "$distro" = arch ] || [ "$distro" = gentoo ]; then
+    elif [ "$distro" = alpine ] || [ "$distro" = arch ] || [ "$distro" = gentoo ] || [ "$distro" = nixos ]; then
         if is_efi; then
             # efi
             parted /dev/$xda -s -- \
@@ -1621,11 +1939,9 @@ create_cloud_init_network_config() {
             # 旧版 cloud-init 有 bug
             # 有的版本会只从第一种配置中读取 dns，有的从第二种读取
             # 因此写两种配置
-            if dns4_list=$(get_current_dns_v4); then
-                for cur in $dns4_list; do
-                    yq -i ".network.config[$config_id].subnets[$subnet_id].dns_nameservers += [\"$cur\"]" $ci_file
-                done
-            fi
+            for cur in $(get_current_dns 4); do
+                yq -i ".network.config[$config_id].subnets[$subnet_id].dns_nameservers += [\"$cur\"]" $ci_file
+            done
             subnet_id=$((subnet_id + 1))
         fi
 
@@ -1674,9 +1990,9 @@ create_cloud_init_network_config() {
         fi
 
         # 有 ipv6 但需设置 dns 的情况
-        if is_need_manual_set_dnsv6 && dns6_list=$(get_current_dns_v6); then
+        if is_need_manual_set_dnsv6; then
             need_set_dns6=true
-            for cur in $dns6_list; do
+            for cur in $(get_current_dns 6); do
                 yq -i ".network.config[$config_id].subnets[$subnet_id].dns_nameservers += [\"$cur\"]" $ci_file
             done
         fi
@@ -1686,13 +2002,13 @@ create_cloud_init_network_config() {
 
     if $need_set_dns4 || $need_set_dns6; then
         yq -i ".network.config[$config_id].type=\"nameserver\"" $ci_file
-        if $need_set_dns4 && dns4_list=$(get_current_dns_v4); then
-            for cur in $dns4_list; do
+        if $need_set_dns4; then
+            for cur in $(get_current_dns 4); do
                 yq -i ".network.config[$config_id].address += [\"$cur\"]" $ci_file
             done
         fi
-        if $need_set_dns6 && dns6_list=$(get_current_dns_v6); then
-            for cur in $dns6_list; do
+        if $need_set_dns6; then
+            for cur in $(get_current_dns 6); do
                 yq -i ".network.config[$config_id].address += [\"$cur\"]" $ci_file
             done
         fi
@@ -2083,12 +2399,18 @@ modify_os_on_disk() {
     error_and_exit "Can't find os partition."
 }
 
+get_need_swap_size() {
+    need_ram=$1
+
+    phy_ram=$(get_approximate_ram_size)
+    echo $((need_ram - phy_ram))
+}
+
 create_swap_if_ram_less_than() {
     need_ram=$1
     swapfile=$2
 
-    phy_ram=$(get_approximate_ram_size)
-    swapsize=$((need_ram - phy_ram))
+    swapsize=$(get_need_swap_size $need_ram)
     if [ $swapsize -gt 0 ]; then
         create_swap $swapsize $swapfile
     fi
@@ -2459,7 +2781,7 @@ install_qcow_by_copy() {
         if [ "$releasever" = 7 ] && [ -f /os/etc/yum.repos.d/CentOS-Base.repo ]; then
             # 保持默认的 http 因为自带的 ssl 证书可能过期
             if is_in_china; then
-                mirror=mirrors.ustc.edu.cn/centos-vault
+                mirror=mirror.nju.edu.cn/centos-vault
             else
                 mirror=vault.centos.org
             fi
@@ -2608,8 +2930,8 @@ EOF
                 if [ -f $file ]; then
                     # cn.archive.ubuntu.com 不在国内还严重丢包
                     # https://www.itdog.cn/ping/cn.archive.ubuntu.com
-                    sed -i 's/archive.ubuntu.com/mirrors.ustc.edu.cn/' $file # x64
-                    sed -i 's/ports.ubuntu.com/mirrors.ustc.edu.cn/' $file   # arm
+                    sed -i 's/archive.ubuntu.com/mirror.nju.edu.cn/' $file # x64
+                    sed -i 's/ports.ubuntu.com/mirror.nju.edu.cn/' $file   # arm
                 fi
             done
         fi
@@ -2842,7 +3164,28 @@ resize_after_install_cloud_image() {
     fi
 }
 
-mount_part_for_install_mode() {
+mount_part_basic_layout() {
+    os_dir=$1
+    efi_dir=$2
+
+    if is_efi || is_xda_gt_2t; then
+        os_part_num=2
+    else
+        os_part_num=1
+    fi
+
+    # 挂载系统分区
+    mkdir -p $os_dir
+    mount -t ext4 /dev/${xda}*${os_part_num} $os_dir
+
+    # 挂载 efi 分区
+    if is_efi; then
+        mkdir -p $efi_dir
+        mount -t vfat -o umask=077 /dev/${xda}*1 $efi_dir
+    fi
+}
+
+mount_part_for_iso_installer() {
     # 挂载主分区
     mkdir -p /os
     mount /dev/disk/by-label/os /os
@@ -2860,7 +3203,7 @@ mount_part_for_install_mode() {
 }
 
 get_dns_list_for_win() {
-    if dns_list=$(get_current_dns_v$1); then
+    if dns_list=$(get_current_dns $1); then
         i=0
         for dns in $dns_list; do
             i=$((i + 1))
@@ -2880,11 +3223,10 @@ create_win_set_netconf_script() {
         if is_staticv4; then
             get_netconf_to ipv4_addr
             get_netconf_to ipv4_gateway
-            ipv4_dns_list="$(get_dns_list_for_win 4)"
             cat <<EOF >>$target
 set ipv4_addr=$ipv4_addr
 set ipv4_gateway=$ipv4_gateway
-$ipv4_dns_list
+$(get_dns_list_for_win 4)
 EOF
         fi
 
@@ -2899,9 +3241,9 @@ EOF
         fi
 
         # 有 ipv6 但需设置 dns 的情况
-        if is_need_manual_set_dnsv6 && ipv6_dns_list="$(get_dns_list_for_win 6)"; then
+        if is_need_manual_set_dnsv6; then
             cat <<EOF >>$target
-$ipv6_dns_list
+$(get_dns_list_for_win 6)
 EOF
         fi
 
@@ -3660,11 +4002,143 @@ EOF
     cat "$grub_cfg"
 }
 
+trans() {
+    mod_motd
+
+    # 先检查 modloop 是否正常
+    # 防止格式化硬盘后，缺少 ext4 模块导致 mount 失败
+    # https://github.com/bin456789/reinstall/issues/136
+    ensure_modloop_started
+
+    cat /proc/cmdline
+    clear_previous
+    add_community_repo
+
+    # 需要在重新分区之前，找到主硬盘
+    # 重新运行脚本时，可指定 xda
+    # xda=sda ash trans.start
+    if [ -z "$xda" ]; then
+        find_xda
+    fi
+
+    if [ "$distro" != "alpine" ]; then
+        setup_nginx_if_enough_ram
+        setup_udev_util_linux
+    fi
+
+    # dd qemu 切换成云镜像模式，暂时没用到
+    if [ "$distro" = "dd" ] && [ "$img_type" = "qemu" ]; then
+        # 移到 reinstall.sh ?
+        distro=any
+        cloud_image=1
+    fi
+
+    if is_use_cloud_image; then
+        case "$img_type" in
+        qemu)
+            create_part
+            download_qcow
+            case "$distro" in
+            centos | alma | rocky | oracle | redhat | anolis | opencloudos | openeuler)
+                # 这几个系统云镜像系统盘是8~9g xfs，而我们的目标是能在5g硬盘上运行，因此改成复制系统文件
+                install_qcow_by_copy
+                ;;
+            ubuntu)
+                # 24.04 云镜像有 boot 分区（在系统分区之前），因此不直接 dd 云镜像
+                install_qcow_by_copy
+                ;;
+            *)
+                # debian fedora opensuse arch gentoo any
+                dd_qcow
+                resize_after_install_cloud_image
+                modify_os_on_disk linux
+                ;;
+            esac
+            ;;
+        gzip | xz)
+            # 暂时没用到 gzip xz 格式的云镜像
+            dd_gzip_xz
+            resize_after_install_cloud_image
+            modify_os_on_disk linux
+            ;;
+        esac
+    elif [ "$distro" = "dd" ]; then
+        case "$img_type" in
+        gzip | xz)
+            dd_gzip_xz
+            modify_os_on_disk windows
+            ;;
+        qemu) # dd qemu 不可能到这里，因为上面已处理
+            ;;
+        esac
+    else
+        # 安装模式
+        case "$distro" in
+        alpine)
+            install_alpine
+            ;;
+        arch | gentoo)
+            create_part
+            install_arch_gentoo
+            ;;
+        nixos)
+            create_part
+            install_nixos
+            ;;
+        *)
+            create_part
+            mount_part_for_iso_installer
+            case "$distro" in
+            centos | alma | rocky | fedora | ubuntu | redhat) install_redhat_ubuntu ;;
+            windows) install_windows ;;
+            esac
+            ;;
+        esac
+    fi
+
+    # 需要用到 lsblk efibootmgr ，只要 1M 左右容量
+    # 因此 alpine 不单独处理
+    if is_efi; then
+        del_invalid_efi_entry
+        add_fallback_efi_to_nvram
+    fi
+
+    echo 'done'
+    # 让 web 输出全部内容
+    sleep 5
+}
+
 # 脚本入口
 # debian initrd 会寻找 main
 # 并调用本文件的 create_ifupdown_config 方法
 : main
 
+# 复制脚本
+# 用于打印错误或者再次运行
+# 路径相同则不用复制
+# 重点：要在删除脚本之前复制
+if ! [ "$(readlink -f "$0")" = /trans.sh ]; then
+    cp -f "$0" /trans.sh
+fi
+trap 'trap_err $LINENO $?' ERR
+
+# 删除本脚本，不然会被复制到新系统
+rm -f /etc/local.d/trans.start
+rm -f /etc/runlevels/default/local
+
+# 提取变量
+extract_env_from_cmdline
+
+# 带参数运行部分
+# 重新下载并 exec 运行新脚本
+if [ "$1" = "update" ]; then
+    # shellcheck disable=SC2154
+    wget -O /trans.sh "$confhome/trans.sh"
+    chmod +x /trans.sh
+    exec /trans.sh
+fi
+
+# 无参数运行部分
 # 允许 ramdisk 使用所有内存，默认是 50%
 mount / -o remount,size=100%
 
@@ -3676,110 +4150,35 @@ hwclock -s || true
 echo "root:$PASSWORD" | chpasswd
 printf '\nyes' | setup-sshd
 
-extract_env_from_cmdline
 # shellcheck disable=SC2154
 if [ "$hold" = 1 ]; then
-    exit
+    if is_run_from_locald; then
+        exit
+    fi
 fi
 
-mod_motd
-setup_tty_and_log
-cat /proc/cmdline
-clear_previous
-add_community_repo
+# 正式运行重装
+# shellcheck disable=SC2046,SC2194
+case 1 in
+1)
+    # ChatGPT 说这种性能最高
+    exec > >(exec tee -a $(get_ttys /dev/) /reinstall.log) 2>&1
+    trans
+    ;;
+2)
+    exec > >(tee -a $(get_ttys /dev/) /reinstall.log) 2>&1
+    trans
+    ;;
+3)
+    trans 2>&1 | tee -a $(get_ttys /dev/) /reinstall.log
+    ;;
+esac
 
-# 需要在重新分区之前，找到主硬盘
-# 重新运行脚本时，可指定 xda
-# xda=sda ash trans.start
-if [ -z "$xda" ]; then
-    find_xda
-fi
-
-if [ "$distro" != "alpine" ]; then
-    setup_nginx_if_enough_ram
-    setup_udev_util_linux
-fi
-
-# dd qemu 切换成云镜像模式，暂时没用到
-if [ "$distro" = "dd" ] && [ "$img_type" = "qemu" ]; then
-    # 移到 reinstall.sh ?
-    distro=any
-    cloud_image=1
-fi
-
-if is_use_cloud_image; then
-    case "$img_type" in
-    qemu)
-        create_part
-        download_qcow
-        case "$distro" in
-        centos | alma | rocky | oracle | redhat | anolis | opencloudos | openeuler)
-            # 这几个系统云镜像系统盘是8~9g xfs，而我们的目标是能在5g硬盘上运行，因此改成复制系统文件
-            install_qcow_by_copy
-            ;;
-        ubuntu)
-            # 24.04 云镜像有 boot 分区（在系统分区之前），因此不直接 dd 云镜像
-            install_qcow_by_copy
-            ;;
-        *)
-            # debian fedora opensuse arch gentoo any
-            dd_qcow
-            resize_after_install_cloud_image
-            modify_os_on_disk linux
-            ;;
-        esac
-        ;;
-    gzip | xz)
-        # 暂时没用到 gzip xz 格式的云镜像
-        dd_gzip_xz
-        resize_after_install_cloud_image
-        modify_os_on_disk linux
-        ;;
-    esac
-elif [ "$distro" = "dd" ]; then
-    case "$img_type" in
-    gzip | xz)
-        dd_gzip_xz
-        modify_os_on_disk windows
-        ;;
-    qemu) # dd qemu 不可能到这里，因为上面已处理
-        ;;
-    esac
-else
-    # 安装模式
-    case "$distro" in
-    alpine)
-        install_alpine
-        ;;
-    arch | gentoo)
-        create_part
-        install_arch_gentoo
-        ;;
-    *)
-        create_part
-        mount_part_for_install_mode
-        case "$distro" in
-        centos | alma | rocky | fedora | ubuntu | redhat) install_redhat_ubuntu ;;
-        windows) install_windows ;;
-        esac
-        ;;
-    esac
-fi
-
-# 需要用到 lsblk efibootmgr ，只要 1M 左右容量
-# 因此 alpine 不单独处理
-if is_efi; then
-    del_invalid_efi_entry
-    add_fallback_efi_to_nvram
-fi
-
-sync
-echo 'done'
 if [ "$hold" = 2 ]; then
     exit
 fi
 
-cd /
-# 让 web 输出全部内容
-sleep 5
+# swapoff -a
+# umount ?
+sync
 reboot
