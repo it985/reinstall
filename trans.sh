@@ -156,28 +156,26 @@ download() {
 
 update_part() {
     sleep 1
+    sync
 
-    # 玄学
-    for i in $(seq 3); do
-        sync
+    # partprobe
+    if is_have_cmd partprobe; then
         partprobe /dev/$xda 2>/dev/null
+    fi
 
-        # partx
-        # https://access.redhat.com/solutions/199573
-        if is_have_cmd partx; then
-            partx -u $1
-        fi
+    # partx
+    # https://access.redhat.com/solutions/199573
+    if is_have_cmd partx; then
+        partx -u /dev/$xda
+    fi
 
-        if rc-service --exists udev && rc-service -q udev status; then
-            # udev
-            udevadm trigger
-            udevadm settle
-        else
-            # busybox mdev
-            # -f 好像没用
-            mdev -sf 2>/dev/null
-        fi
-    done
+    # mdev
+    if rc-service --exists mdev && rc-service -q mdev status; then
+        # mdev 不会删除 /dev/disk/ 的旧分区，因此手动删除
+        rm -rf /dev/disk/*
+        mdev -sf 2>/dev/null
+        rc-service mdev restart
+    fi
 }
 
 is_efi() {
@@ -233,14 +231,6 @@ setup_lighttpd() {
     apk add lighttpd
     ln -sf /reinstall.html /var/www/localhost/htdocs/index.html
     rc-service lighttpd start
-}
-
-setup_udev_util_linux() {
-    # mdev 不会删除 /sys/block/by-label 的旧分区名，所以用 udev
-    # util-linux 包含 lsblk
-    # util-linux 可自动探测 mount 格式
-    apk add udev util-linux
-    rc-service udev start
 }
 
 get_ttys() {
@@ -1153,6 +1143,11 @@ add_newline() {
 install_nixos() {
     os_dir=/os
     keep_swap=true
+    nix_from=website
+    ram_per_thread=2048
+
+    threads=$(get_build_threads $ram_per_thread)
+    swap_size=$(get_need_swap_size $ram_per_thread)
 
     show_nixos_config() {
         echo
@@ -1164,9 +1159,7 @@ install_nixos() {
 
     # 挂载分区，创建 swapfile
     mount_part_basic_layout /os /os/efi
-    need_ram=2048
-    swap_size=$(get_need_swap_size $need_ram)
-    create_swap_if_ram_less_than $need_ram /os/swapfile
+    create_swap $swap_size /os/swapfile
 
     # 步骤
     # 1. 安装 nix (nix-xxx)
@@ -1175,28 +1168,61 @@ install_nixos() {
     # 4. 运行 nixos-install
 
     # nix 安装方式                                    分支          版本
-    # apk add nix                                    3.20         2.22.0   #  nix 本体跟正常的软件一样，不在 /nix/store 里面
+    # apk add nix                                    3.20         2.22.0  # nix 本体跟 alpine 正常的软件一样，不在 /nix/store 里面
     # env -iA nixpkgs.nix                            24.05        2.18.5
     # sh <(curl -L https://nixos.org/nix/install)   unstable?     2.24.2
+
+    # apk add 安装的 nix 有时会卡在
+    # copying path '/nix/store/gcbrjlfm5h21ybf1h2lfq773zafjmzjr-curl-8.7.1-man' from 'https://cache.nixos.org'...
+    # 但是 cpu 空载
 
     # 安装 nix
     mkdir -p /os/nix /nix
     mount --bind /os/nix /nix
-    apk add nix
 
-    # TODO: 有时安装系统时会出错，卡在
-    # copying path '/nix/store/gcbrjlfm5h21ybf1h2lfq773zafjmzjr-curl-8.7.1-man' from 'https://cache.nixos.org'...
-    # 但是 cpu 空载
+    # nix 安装脚本和 /root/.nix-profile/etc/profile.d/nix.sh 都会用到这两个变量
+    # 但从 alpine local.d 运行没有这两个变量
+    export USER=root
+    export HOME=/root
 
-    # 设置 nix 镜像和线程
-    # alpine 默认设置了 4 线程
-    # https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/nix/APKBUILD#L125
-    sed -i '/max-jobs/d' /etc/nix/nix.conf
-    echo "max-jobs = $(get_build_threads 2048)" >>/etc/nix/nix.conf
-    if is_in_china; then
-        echo "substituters = $mirror/store" >>/etc/nix/nix.conf
-    fi
-    rc-service nix-daemon restart
+    case "$nix_from" in
+    alpine)
+        apk add nix
+        # 设置 nix 镜像和线程
+        # alpine 默认设置了 4 线程
+        # https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/nix/APKBUILD#L125
+        sed -i '/max-jobs/d' /etc/nix/nix.conf
+        echo "max-jobs = $threads" >>/etc/nix/nix.conf
+        if is_in_china; then
+            echo "substituters = $mirror/store" >>/etc/nix/nix.conf
+        fi
+        rc-service nix-daemon restart
+        # 添加 nix-env 安装的软件到 PATH
+        PATH="/root/.nix-profile/bin:$PATH"
+        ;;
+    website)
+        # https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/community/nix/nix.pre-install
+        # https://nix.dev/manual/nix/latest/installation/multi-user
+        if ! grep -q nixbld /etc/passwd; then
+            addgroup -S nixbld
+            for n in $(seq 1 10); do
+                adduser -S -D -H -h /var/empty -s /sbin/nologin -G nixbld \
+                    -g "Nix build user $n" nixbld$n
+            done
+        fi
+
+        if is_in_china; then
+            sh=https://mirror.nju.edu.cn/nix/latest/install
+        else
+            sh=https://nixos.org/nix/install
+        fi
+        apk add xz
+        wget -O- "$sh" | sh -s -- --no-channel-add
+        apk del xz
+        # shellcheck source=/dev/null
+        . /root/.nix-profile/etc/profile.d/nix.sh
+        ;;
+    esac
 
     # 添加 channel
     # shellcheck disable=SC2154
@@ -1206,15 +1232,12 @@ install_nixos() {
     # 安装 channal 的 nix
     # shellcheck source=/dev/null
     if false; then
-        nix-env -iA nixpkgs.nix
+        nix-env -iA nixpkgs.nix -j $threads
         . ~/.nix-profile/etc/profile.d/nix.sh
     fi
 
     # 安装 nixos-install-tools
-    nix-env -iA nixpkgs.nixos-install-tools
-
-    # 添加 nix-env 安装的软件到 PATH
-    PATH="/root/.nix-profile/bin:$PATH"
+    nix-env -iA nixpkgs.nixos-install-tools -j $threads
 
     # 生成配置并显示
     nixos-generate-config --root /os
@@ -1290,7 +1313,7 @@ EOF
     show_nixos_config
 
     # 安装系统
-    nixos-install --root /os --no-root-passwd -j "$(get_build_threads 2048)"
+    nixos-install --root /os --no-root-passwd -j $threads
 
     # 设置密码
     echo "root:$PASSWORD" | nixos-enter --root /os -- \
@@ -1627,18 +1650,27 @@ get_http_file_size_to() {
     fi
 }
 
-# shellcheck disable=SC2154
-dd_gzip_xz() {
+dd_gzip_xz_raw() {
+    # 用官方 wget，一来带进度条，二来自带重试
+    # alpine busybox 自带 gzip xz，但官方版也许性能更好
+    # raw 包括 vhd
+    # shellcheck disable=SC2154
     case "$img_type" in
-    gzip) prog=gzip ;;
-    xz) prog=xz ;;
+    xz | gzip) apk add wget $img_type ;;
+    raw) apk add wget ;;
     *) error_and_exit 'Not supported' ;;
     esac
 
-    # alpine busybox 自带 gzip xz，但官方版也许性能更好
-    # 用官方 wget，一来带进度条，二来自带重试
-    apk add wget $prog
-    if ! command wget $img -O- --tries=5 --progress=bar:force | $prog -dc >/dev/$xda 2>/tmp/dd_stderr; then
+    pipe_extract() {
+        if [ "$img_type" = raw ]; then
+            cat
+        else
+            $img_type -dc
+        fi
+    }
+
+    if ! command wget $img -O- --tries=5 --progress=bar:force |
+        pipe_extract >/dev/$xda 2>/tmp/dd_stderr; then
         # vhd 文件结尾有 512 字节额外信息，可以忽略
         if grep -iq 'No space' /tmp/dd_stderr; then
             apk add parted
@@ -1719,7 +1751,7 @@ create_part() {
                 set 1 boot on \
                 set 2 msftres on \
                 set 3 msftdata on
-            update_part /dev/$xda
+            update_part
 
             mkfs.fat -n efi /dev/$xda*1                 #1 efi
             echo                                        #2 msr
@@ -1733,7 +1765,7 @@ create_part() {
                 mkpart primary ntfs 1MiB -${part_size} \
                 mkpart primary ntfs -${part_size} ${max_usable_size} \
                 set 1 boot on
-            update_part /dev/$xda
+            update_part
 
             mkfs.ext4 -E nodiscard -F -L os /dev/$xda*1 #1 os
             mkfs.ntfs -f -F -L installer /dev/$xda*2    #2 installer
@@ -1753,7 +1785,7 @@ create_part() {
                     mkpart '" "' $fs 101MiB -$installer_part_size \
                     mkpart '" "' ext4 -$installer_part_size 100% \
                     set 1 esp on
-                update_part /dev/$xda
+                update_part
 
                 mkfs.fat -n efi /dev/$xda*1                        #1 efi
                 echo                                               #2 os 用目标系统的格式化工具
@@ -1765,7 +1797,7 @@ create_part() {
                     mkpart '" "' $fs 2MiB -$installer_part_size \
                     mkpart '" "' ext4 -$installer_part_size 100% \
                     set 1 bios_grub on
-                update_part /dev/$xda
+                update_part
 
                 echo                                               #1 bios_boot
                 echo                                               #2 os 用目标系统的格式化工具
@@ -1778,7 +1810,7 @@ create_part() {
                 mklabel gpt \
                 mkpart '" "' ext4 1MiB -$installer_part_size \
                 mkpart '" "' ext4 -$installer_part_size 100%
-            update_part /dev/$xda
+            update_part
 
             mkfs.ext4 -E nodiscard -F -L os /dev/$xda*1        #1 os
             mkfs.ext4 -E nodiscard -F -L installer /dev/$xda*2 #2 installer
@@ -1791,7 +1823,7 @@ create_part() {
                 mkpart '" "' fat32 1MiB 101MiB \
                 mkpart '" "' ext4 101MiB 100% \
                 set 1 boot on
-            update_part /dev/$xda
+            update_part
 
             mkfs.fat /dev/$xda*1                  #1 efi
             mkfs.ext4 -E nodiscard -F /dev/$xda*2 #2 os
@@ -1802,7 +1834,7 @@ create_part() {
                 mkpart '" "' ext4 1MiB 2MiB \
                 mkpart '" "' ext4 2MiB 100% \
                 set 1 bios_grub on
-            update_part /dev/$xda
+            update_part
 
             echo                                  #1 bios_boot
             mkfs.ext4 -E nodiscard -F /dev/$xda*2 #2 os
@@ -1812,7 +1844,7 @@ create_part() {
                 mklabel msdos \
                 mkpart primary ext4 1MiB 100% \
                 set 1 boot on
-            update_part /dev/$xda
+            update_part
 
             mkfs.ext4 -E nodiscard -F /dev/$xda*1 #1 os
         fi
@@ -1830,7 +1862,7 @@ create_part() {
                 mkpart '" "' ext4 1025MiB -2GiB \
                 mkpart '" "' ext4 -2GiB 100% \
                 set 1 boot on
-            update_part /dev/$xda
+            update_part
 
             mkfs.fat -n efi /dev/$xda*1                 #1 efi
             mkfs.ext4 -E nodiscard -F -L os /dev/$xda*2 #2 os
@@ -1843,7 +1875,7 @@ create_part() {
                 mkpart '" "' ext4 2MiB -2GiB \
                 mkpart '" "' ext4 -2GiB 100% \
                 set 1 bios_grub on
-            update_part /dev/$xda
+            update_part
 
             echo                                        #1 bios_boot
             mkfs.ext4 -E nodiscard -F -L os /dev/$xda*2 #2 os
@@ -1855,12 +1887,12 @@ create_part() {
                 mkpart primary ext4 1MiB -2GiB \
                 mkpart primary ext4 -2GiB 100% \
                 set 1 boot on
-            update_part /dev/$xda
+            update_part
 
             mkfs.ext4 -E nodiscard -F -L os /dev/$xda*1 #1 os
             mkfs.fat -n installer /dev/$xda*2           #2 installer
         fi
-        update_part /dev/$xda
+        update_part
 
         # centos 7 无法加载alpine格式化的ext4
         # 要关闭这个属性
@@ -1871,7 +1903,7 @@ create_part() {
         fi
     fi
 
-    update_part /dev/$xda
+    update_part
 
     # alpine 删除分区工具，防止 256M 小机爆内存
     # setup-disk /dev/sda 会保留格式化工具，我们也保留
@@ -2357,7 +2389,7 @@ EOF
 modify_os_on_disk() {
     only_process=$1
 
-    update_part /dev/$xda
+    update_part
 
     # dd linux 的时候不用修改硬盘内容
     if [ "$distro" = "dd" ] && ! lsblk -f /dev/$xda | grep ntfs; then
@@ -2401,9 +2433,13 @@ modify_os_on_disk() {
 
 get_need_swap_size() {
     need_ram=$1
-
     phy_ram=$(get_approximate_ram_size)
-    echo $((need_ram - phy_ram))
+
+    if [ $need_ram -gt $phy_ram ]; then
+        echo $((need_ram - phy_ram))
+    else
+        echo 0
+    fi
 }
 
 create_swap_if_ram_less_than() {
@@ -2745,7 +2781,7 @@ install_qcow_by_copy() {
         umount /os/boot/efi/
         apk add mtools
         mlabel -N "$(echo $efi_part_uuid | sed 's/-//')" -i /dev/$xda*1 ::$efi_part_label
-        update_part /dev/$xda
+        update_part
         mount -o $efi_mount_opts /dev/$xda*1 /os/boot/efi/
     fi
 
@@ -3135,7 +3171,7 @@ dd_qcow() {
     # 将前1M从内存 dd 到硬盘
     umount /installer/
     dd if=/first-1M of=/dev/$xda
-    update_part /dev/$xda
+    update_part
 
 }
 
@@ -3152,14 +3188,14 @@ resize_after_install_cloud_image() {
         if fix_partition_table_by_parted 2>&1 | grep -q 'Fixing'; then
             system_part_num=$(parted /dev/$xda -m print | tail -1 | cut -d: -f1)
             printf "yes" | parted /dev/$xda resizepart $system_part_num 100% ---pretend-input-tty
-            update_part /dev/$xda
+            update_part
 
             if [ "$distro" = gentoo ]; then
                 apk add e2fsprogs-extra
                 e2fsck -p -f /dev/$xda*$system_part_num
                 resize2fs /dev/$xda*$system_part_num
             fi
-            update_part /dev/$xda
+            update_part
         fi
     fi
 }
@@ -4023,7 +4059,9 @@ trans() {
 
     if [ "$distro" != "alpine" ]; then
         setup_nginx_if_enough_ram
-        setup_udev_util_linux
+        # util-linux 包含 lsblk
+        # util-linux 可自动探测 mount 格式
+        apk add util-linux
     fi
 
     # dd qemu 切换成云镜像模式，暂时没用到
@@ -4055,17 +4093,17 @@ trans() {
                 ;;
             esac
             ;;
-        gzip | xz)
+        gzip | xz | raw)
             # 暂时没用到 gzip xz 格式的云镜像
-            dd_gzip_xz
+            dd_gzip_xz_raw
             resize_after_install_cloud_image
             modify_os_on_disk linux
             ;;
         esac
     elif [ "$distro" = "dd" ]; then
         case "$img_type" in
-        gzip | xz)
-            dd_gzip_xz
+        gzip | xz | raw)
+            dd_gzip_xz_raw
             modify_os_on_disk windows
             ;;
         qemu) # dd qemu 不可能到这里，因为上面已处理

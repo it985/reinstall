@@ -52,8 +52,7 @@ Usage: $reinstall____ centos      9
                       kali
                       arch
                       gentoo
-                      dd          --img='http://xxx.com/xxx.xz'
-                      dd          --img='http://xxx.com/xxx.gzip'
+                      dd          --img='http://xxx.com/xxx.raw'  (supports raw vhd gzip xz)
                       windows     --image-name='windows xxx yyy'  --lang=xx-yy
                       windows     --image-name='windows xxx yyy'  --iso='http://xxx.com/xxx.iso'
                       netboot.xyz
@@ -978,7 +977,9 @@ setos() {
             :
         else
             # 传统安装
-            test_url $mirror/nixos-$releasever/store-paths.xz xz
+            # 该服务器文件缓存 miss 时会响应 206 + Location 头
+            # 但 curl 这种情况不会重定向，所以添加 ascii 类型让它不要报错
+            test_url $mirror/nixos-$releasever/store-paths.xz xz/ascii
             eval ${step}_mirror=$mirror
         fi
     }
@@ -1061,10 +1062,32 @@ setos() {
 
     # shellcheck disable=SC2154
     setos_dd() {
-        test_url $img 'xz|gzip' img_type
+        # 下面两种都是 raw
+        # DOS/MBR boot sector
+        # x86 boot sector; partition 1: ...
+        test_url $img 'xz|gzip|dos/mbr|x86' img_type
+
+        # 修正 raw 的 img_type
+        if [ "$img_type" = dos/mbr ] || [ "$img_type" = x86 ]; then
+            img_type=raw
+        fi
 
         if is_efi; then
-            install_pkg hexdump $img_type
+            install_pkg hexdump
+
+            if ! [ "$img_type" = raw ]; then
+                install_pkg $img_type
+            fi
+
+            extract() {
+                if [ "$img_type" = raw ]; then
+                    cat "$1"
+                else
+                    # xz/gzip -d 文件必须有正确的扩展名，否则报扩展名错误
+                    # 因此用 stdin
+                    $img_type -dc <"$1"
+                fi
+            }
 
             # openwrt 镜像 efi part type 不是 esp
             # 因此改成检测 fat?
@@ -1077,7 +1100,7 @@ setos() {
 
             # 仅打印前34个扇区 * 4096字节（按最大的算）
             # 每行128字节
-            "$img_type" -dc <"$tmp/img-test" | hexdump -n $((34 * 4096)) -e '128/1 "%02x" "\n"' -v >$tmp/img-test-hex
+            extract "$tmp/img-test" | hexdump -n $((34 * 4096)) -e '128/1 "%02x" "\n"' -v >$tmp/img-test-hex
             if grep -q '^28732ac11ff8d211ba4b00a0c93ec93b' $tmp/img-test-hex; then
                 echo 'DD: Image is EFI.'
             else
@@ -1085,7 +1108,7 @@ setos() {
                 warn '
 The current machine uses EFI boot, but the DD image is not an EFI image.
 Continue with DD?
-当前机器使用 EFI 引导，但 DD 镜像不是 EFI 镜像。
+当前机器使用 EFI 引导，但 DD 镜像可能不是 EFI 镜像。
 继续 DD?'
                 read -r -p '[y/N]: '
                 if [[ "$REPLY" = [Yy] ]]; then
@@ -1905,7 +1928,7 @@ collect_netconf() {
                     eval ipv${v}_ethx="$ethx" # can_use_cloud_kernel 要用
                     eval ipv${v}_mac="$(ip link show dev $ethx | grep link/ether | head -1 | awk '{print $2}')"
                     eval ipv${v}_gateway="$(ip -$v route show default | awk '$5=="'$ethx'"' | head -1 | awk '{print $3}')"
-                    eval ipv${v}_addr="$(ip -$v -o addr show scope global dev $ethx | head -1 | awk '{print $4}')"
+                    eval ipv${v}_addr="$(ip -$v -o addr show scope global dev $ethx | grep -v temporary | head -1 | awk '{print $4}')"
                 fi
             fi
         done
