@@ -6,6 +6,10 @@
 # 出错后停止运行，将进入到登录界面，防止失联
 set -eE
 
+# 用于判断 reinstall.sh 和 trans.sh 是否兼容
+# shellcheck disable=SC2034
+SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0001
+
 # debian 安装版、ubuntu 安装版、el/ol 安装版不使用该密码
 PASSWORD=123@@@
 
@@ -17,6 +21,12 @@ error() {
     color='\e[31m'
     plain='\e[0m'
     echo -e "${color}Error: $*${plain}" >&2
+}
+
+info() {
+    color='\e[32m'
+    plain='\e[0m'
+    echo -e "${color}***** $(echo "$*" | to_upper) *****${plain}" >&2
 }
 
 error_and_exit() {
@@ -55,13 +65,21 @@ add_community_repo() {
 # 有时网络问题下载失败，导致脚本中断
 # 因此需要重试
 apk() {
-    retry 5 command apk "$@"
+    retry 5 command apk "$@" >&2
 }
 
-# busybox 的 wget 没有重试功能
+# 在没有设置 set +o pipefail 的情况下，限制下载大小：
+# retry 5 command wget | head -c 1048576 会触发 retry，下载 5 次
+# command wget "$@" --tries=5 | head -c 1048576 不会触发 wget 自带的 retry，只下载 1 次
 wget() {
     echo "$@" | grep -o 'http[^ ]*' >&2
-    retry 5 command wget "$@"
+    if command wget 2>&1 | grep -q BusyBox; then
+        # busybox wget 没有重试功能
+        retry 5 command wget "$@"
+    else
+        # 原版 wget 自带重试功能
+        command wget --tries=5 --progress=bar:force "$@"
+    fi
 }
 
 is_have_cmd() {
@@ -170,12 +188,19 @@ update_part() {
     fi
 
     # mdev
-    if rc-service --exists mdev && rc-service -q mdev status; then
-        # mdev 不会删除 /dev/disk/ 的旧分区，因此手动删除
-        rm -rf /dev/disk/*
-        mdev -sf 2>/dev/null
-        rc-service mdev restart
-    fi
+    # mdev 不会删除 /dev/disk/ 的旧分区，因此手动删除
+    # 如果 rm -rf 的时候刚好 mdev 在创建链接，rm -rf 会报错 Directory not empty
+    # 因此要先停止 mdev 服务
+    # 还要删除 /dev/$xda*?
+    rc-service mdev stop
+    rm -rf /dev/disk/*
+
+    # 没挂载 modloop 时会提示
+    # modprobe: can't change directory to '/lib/modules': No such file or directory
+    # 因此强制不显示上面的提示
+    mdev -sf 2>/dev/null
+    rc-service mdev start 2>/dev/null
+    sleep 1
 }
 
 is_efi() {
@@ -354,18 +379,40 @@ clear_previous() {
     # mount /1/file2 /2
 }
 
-get_virt_to() {
-    if [ -z "$_virt" ]; then
+cache_dmi_and_virt() {
+    if [ -z "$_dmi" ] || [ -z "$_virt" ]; then
+        # virt-what 自动安装 dmidecode
         apk add virt-what
-        _virt="$(virt-what)"
+        _virt=$(virt-what)
+        _dmi=$(dmidecode | grep -E '(Manufacturer|Asset Tag|Vendor): ' | awk -F': ' '{print $2}')
         apk del virt-what
     fi
-    eval "$1='$_virt'"
 }
 
 is_virt() {
-    get_virt_to virt
-    [ -n "$virt" ]
+    cache_dmi_and_virt
+    [ -n "$_virt" ]
+}
+
+is_virt_contains() {
+    cache_dmi_and_virt
+    echo "$_virt" | grep -Eiwq "$1"
+}
+
+is_dmi_contains() {
+    # Manufacturer: Alibaba Cloud
+    # Manufacturer: Tencent Cloud
+    # Manufacturer: Huawei Cloud
+    # Asset Tag: OracleCloud.com
+    # Vendor: Amazon EC2
+    # Manufacturer: Amazon EC2
+    # Asset Tag: Amazon EC2
+    cache_dmi_and_virt
+    echo "$_dmi" | grep -Eiwq "$1"
+}
+
+show_netconf() {
+    grep -r . /dev/netconf/
 }
 
 get_ra_to() {
@@ -378,10 +425,13 @@ get_ra_to() {
         apk del ndisc6
 
         # 显示网络配置
+        info "Network info:"
         echo
         echo "$_ra" | cat -n
         echo
         ip addr | cat -n
+        echo
+        show_netconf | cat -n
         echo
     fi
     eval "$1='$_ra'"
@@ -568,6 +618,7 @@ get_fallback_efi_file_name() {
 }
 
 del_invalid_efi_entry() {
+    info "del invalid EFI entry"
     apk add lsblk efibootmgr
 
     efibootmgr --quiet --remove-dups
@@ -587,8 +638,12 @@ grep_efi_index() {
 }
 
 # 某些机器可能不会回落到 bootx64.efi
-# 因此手动添加一个回落项
-add_fallback_efi_to_nvram() {
+# 阿里云 ECS 启动项有 EFI Shell
+# 添加 bootx64.efi 到最后的话，会进入 EFI Shell
+# 因此添加到最前面
+add_default_efi_to_nvram() {
+    info "add default EFI to nvram"
+
     apk add lsblk efibootmgr
 
     if efi_row=$(lsblk /dev/$xda -ro NAME,PARTTYPE,PARTUUID | grep -i "$EFI_UUID"); then
@@ -598,22 +653,13 @@ add_fallback_efi_to_nvram() {
         efi_file=$(get_fallback_efi_file_name)
 
         # 创建条目，先判断是否已经存在
-        if ! efibootmgr | grep -i "HD($efi_part_num,GPT,$efi_part_uuid,.*)/File(\\\EFI\\\boot\\\\$efi_file)"; then
-            fallback_id=$(efibootmgr --create-only \
+        # 好像没必要先判断
+        if true || ! efibootmgr | grep -i "HD($efi_part_num,GPT,$efi_part_uuid,.*)/File(\\\EFI\\\boot\\\\$efi_file)"; then
+            efibootmgr --create \
                 --disk "/dev/$xda" \
                 --part "$efi_part_num" \
-                --label "fallback" \
-                --loader "\\EFI\\boot\\$efi_file" |
-                tail -1 | grep_efi_index)
-
-            # 添加到最后
-            orig_order=$(efibootmgr | grep -F BootOrder: | awk '{print $2}')
-            if [ -n "$orig_order" ]; then
-                new_order="$orig_order,$fallback_id"
-            else
-                new_order="$fallback_id"
-            fi
-            efibootmgr --bootorder "$new_order"
+                --label "$efi_file" \
+                --loader "\\EFI\\boot\\$efi_file"
         fi
     else
         # shellcheck disable=SC2154
@@ -966,6 +1012,8 @@ EOF
 }
 
 install_alpine() {
+    info "install alpine"
+
     hack_lowram_modloop=true
     hack_lowram_swap=true
 
@@ -1141,6 +1189,8 @@ add_newline() {
 }
 
 install_nixos() {
+    info "Install NixOS"
+
     os_dir=/os
     keep_swap=true
     nix_from=website
@@ -1166,6 +1216,7 @@ install_nixos() {
     # 2. 用 nix 安装 nixos-install-tools (nixos-xxx)
     # 3. 运行 nixos-generate-config 生成配置 + 编辑
     # 4. 运行 nixos-install
+    # https://nixos.org/manual/nixos/stable/index.html#sec-installing-from-other-distro
 
     # nix 安装方式                                    分支          版本
     # apk add nix                                    3.20         2.22.0  # nix 本体跟 alpine 正常的软件一样，不在 /nix/store 里面
@@ -1351,6 +1402,8 @@ EOF
 }
 
 install_arch_gentoo() {
+    info "install $distro"
+
     set_locale() {
         echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
         chroot $os_dir locale-gen
@@ -1571,9 +1624,7 @@ EOF
     allow_root_password_login $os_dir
 
     # 修改密码
-    [ "$distro" = gentoo ] && sed -i 's/enforce=everyone/enforce=none/' $os_dir/etc/security/passwdqc.conf
-    echo "root:$PASSWORD" | chroot $os_dir chpasswd
-    [ "$distro" = gentoo ] && sed -i 's/enforce=none/enforce=everyone/' $os_dir/etc/security/passwdqc.conf
+    change_root_password $os_dir
 
     # 网络配置
     apk add cloud-init
@@ -1634,43 +1685,36 @@ EOF
     rm -rf $os_dir/swapfile
 }
 
-get_http_file_size_to() {
-    var_name=$1
-    url=$2
+get_http_file_size() {
+    url=$1
 
-    size=''
-    if wget --spider -S $url -o /tmp/headers.log; then
-        # 网址重定向可能得到多个 Content-Length, 选最后一个
-        if size=$(grep 'Content-Length:' /tmp/headers.log |
-            tail -1 | awk '{print $2}' | grep .); then
-            eval "$var_name='$size'"
-        fi
+    # 网址重定向可能得到多个 Content-Length, 选最后一个
+    wget --spider -S "$url" 2>&1 | grep 'Content-Length:' |
+        tail -1 | awk '{print $2}' | grep .
+}
+
+pipe_extract() {
+    # alpine busybox 自带 gzip，但官方版也许性能更好
+    case "$img_type_warp" in
+    xz | gzip) apk add $img_type_warp ;;
+    '') ;;
+    *) error_and_exit "Not supported img_type_warp: $img_type_warp" ;;
+    esac
+
+    if [ -n "$img_type_warp" ]; then
+        "$img_type_warp" -dc
     else
-        error_and_exit "Can't access $url"
+        cat
     fi
 }
 
 dd_gzip_xz_raw() {
-    # 用官方 wget，一来带进度条，二来自带重试
-    # alpine busybox 自带 gzip xz，但官方版也许性能更好
-    # raw 包括 vhd
-    # shellcheck disable=SC2154
-    case "$img_type" in
-    xz | gzip) apk add wget $img_type ;;
-    raw) apk add wget ;;
-    *) error_and_exit 'Not supported' ;;
-    esac
+    info "dd gzip xz raw"
 
-    pipe_extract() {
-        if [ "$img_type" = raw ]; then
-            cat
-        else
-            $img_type -dc
-        fi
-    }
+    # 用官方 wget，一来带进度条，二来自带重试功能
+    apk add wget
 
-    if ! command wget $img -O- --tries=5 --progress=bar:force |
-        pipe_extract >/dev/$xda 2>/tmp/dd_stderr; then
+    if ! wget $img -O- | pipe_extract >/dev/$xda 2>/tmp/dd_stderr; then
         # vhd 文件结尾有 512 字节额外信息，可以忽略
         if grep -iq 'No space' /tmp/dd_stderr; then
             apk add parted
@@ -1712,6 +1756,7 @@ is_xda_gt_2t() {
 
 create_part() {
     # 除了 dd 都会用到
+    info "Create Part"
 
     # 分区工具
     apk add parted e2fsprogs
@@ -1726,10 +1771,8 @@ create_part() {
     # xda*1 星号用于 nvme0n1p1 的字母 p
     # shellcheck disable=SC2154
     if [ "$distro" = windows ]; then
-        get_http_file_size_to size_bytes $iso
-
-        # 默认值，最大的iso 23h2 需要7g
-        if [ -z "$size_bytes" ]; then
+        if ! size_bytes=$(get_http_file_size "$iso"); then
+            # 默认值，最大的iso 23h2 假设 7g
             size_bytes=$((7 * 1024 * 1024 * 1024))
         fi
 
@@ -1771,7 +1814,7 @@ create_part() {
             mkfs.ntfs -f -F -L installer /dev/$xda*2    #2 installer
         fi
     elif is_use_cloud_image; then
-        installer_part_size="$(get_ci_installer_part_size)"
+        installer_part_size="$(get_cloud_image_part_size)"
         # 这几个系统不使用dd，而是复制文件
         if [ "$distro" = centos ] || [ "$distro" = alma ] || [ "$distro" = rocky ] ||
             [ "$distro" = oracle ] || [ "$distro" = redhat ] ||
@@ -1816,6 +1859,10 @@ create_part() {
             mkfs.ext4 -E nodiscard -F -L installer /dev/$xda*2 #2 installer
         fi
     elif [ "$distro" = alpine ] || [ "$distro" = arch ] || [ "$distro" = gentoo ] || [ "$distro" = nixos ]; then
+        # alpine 本身关闭了 64bit ext4
+        # https://gitlab.alpinelinux.org/alpine/alpine-conf/-/blob/3.18.1/setup-disk.in?ref_type=tags#L908
+        # 而且 alpine 的 extlinux 不兼容 64bit ext4
+        [ "$distro" = alpine ] && ext4_opts="-O ^64bit" || ext4_opts=
         if is_efi; then
             # efi
             parted /dev/$xda -s -- \
@@ -1825,8 +1872,8 @@ create_part() {
                 set 1 boot on
             update_part
 
-            mkfs.fat /dev/$xda*1                  #1 efi
-            mkfs.ext4 -E nodiscard -F /dev/$xda*2 #2 os
+            mkfs.fat /dev/$xda*1                             #1 efi
+            mkfs.ext4 -E nodiscard -F $ext4_opts /dev/$xda*2 #2 os
         elif is_xda_gt_2t; then
             # bios > 2t
             parted /dev/$xda -s -- \
@@ -1836,8 +1883,8 @@ create_part() {
                 set 1 bios_grub on
             update_part
 
-            echo                                  #1 bios_boot
-            mkfs.ext4 -E nodiscard -F /dev/$xda*2 #2 os
+            echo                                             #1 bios_boot
+            mkfs.ext4 -E nodiscard -F $ext4_opts /dev/$xda*2 #2 os
         else
             # bios
             parted /dev/$xda -s -- \
@@ -1846,61 +1893,70 @@ create_part() {
                 set 1 boot on
             update_part
 
-            mkfs.ext4 -E nodiscard -F /dev/$xda*1 #1 os
+            mkfs.ext4 -E nodiscard -F $ext4_opts /dev/$xda*1 #1 os
         fi
     else
         # 安装红帽系或ubuntu
         # 对于红帽系是临时分区表，安装时除了 installer 分区，其他分区会重建为默认的大小
         # 对于ubuntu是最终分区表，因为 ubuntu 的安装器不能调整个别分区，只能重建整个分区表
         # installer 2g分区用fat格式刚好塞得下ubuntu-22.04.3 iso，而ext4塞不下或者需要改参数
+        if [ "$distro" = ubuntu ]; then
+            if ! size_bytes=$(get_http_file_size "$iso"); then
+                # 默认值，假设 iso 3g
+                size_bytes=$((3 * 1024 * 1024 * 1024))
+            fi
+            # 假设需要预留 10% 空间
+            size_bytes_mb=$((size_bytes * 110 / 100 / 1024 / 1024))
+            installer_part_size=${size_bytes_mb}MiB
+        else
+            # redhat
+            installer_part_size=2GiB
+        fi
+
+        # centos 7 无法加载alpine格式化的ext4
+        # 要关闭这个属性
+        ext4_opts="-O ^metadata_csum"
         apk add dosfstools
+
         if is_efi; then
             # efi
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' fat32 1MiB 1025MiB \
-                mkpart '" "' ext4 1025MiB -2GiB \
-                mkpart '" "' ext4 -2GiB 100% \
+                mkpart '" "' ext4 1025MiB -$installer_part_size \
+                mkpart '" "' ext4 -$installer_part_size 100% \
                 set 1 boot on
             update_part
 
-            mkfs.fat -n efi /dev/$xda*1                 #1 efi
-            mkfs.ext4 -E nodiscard -F -L os /dev/$xda*2 #2 os
-            mkfs.fat -n installer /dev/$xda*3           #3 installer
+            mkfs.fat -n efi /dev/$xda*1                                   #1 efi
+            mkfs.ext4 -E nodiscard -F -L os /dev/$xda*2                   #2 os
+            mkfs.ext4 -E nodiscard -F -L installer $ext4_opts /dev/$xda*3 #2 installer
         elif is_xda_gt_2t; then
             # bios > 2t
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' ext4 1MiB 2MiB \
-                mkpart '" "' ext4 2MiB -2GiB \
-                mkpart '" "' ext4 -2GiB 100% \
+                mkpart '" "' ext4 2MiB -$installer_part_size \
+                mkpart '" "' ext4 -$installer_part_size 100% \
                 set 1 bios_grub on
             update_part
 
-            echo                                        #1 bios_boot
-            mkfs.ext4 -E nodiscard -F -L os /dev/$xda*2 #2 os
-            mkfs.fat -n installer /dev/$xda*3           #3 installer
+            echo                                                          #1 bios_boot
+            mkfs.ext4 -E nodiscard -F -L os /dev/$xda*2                   #2 os
+            mkfs.ext4 -E nodiscard -F -L installer $ext4_opts /dev/$xda*3 #3 installer
         else
             # bios
             parted /dev/$xda -s -- \
                 mklabel msdos \
-                mkpart primary ext4 1MiB -2GiB \
-                mkpart primary ext4 -2GiB 100% \
+                mkpart primary ext4 1MiB -$installer_part_size \
+                mkpart primary ext4 -$installer_part_size 100% \
                 set 1 boot on
             update_part
 
-            mkfs.ext4 -E nodiscard -F -L os /dev/$xda*1 #1 os
-            mkfs.fat -n installer /dev/$xda*2           #2 installer
+            mkfs.ext4 -E nodiscard -F -L os /dev/$xda*1                   #1 os
+            mkfs.ext4 -E nodiscard -F -L installer $ext4_opts /dev/$xda*2 #2 installer
         fi
         update_part
-
-        # centos 7 无法加载alpine格式化的ext4
-        # 要关闭这个属性
-        # 目前改用fat格式，不用设置这个
-        if false && [ "$distro" = centos ]; then
-            apk add e2fsprogs-extra
-            tune2fs -O ^metadata_csum_seed /dev/disk/by-label/installer
-        fi
     fi
 
     update_part
@@ -1935,6 +1991,7 @@ get_yq_name() {
 
 create_cloud_init_network_config() {
     ci_file=$1
+    info "Create Cloud Init network config"
 
     apk add "$(get_yq_name)"
 
@@ -2097,6 +2154,7 @@ EOF
 
 modify_windows() {
     os_dir=$1
+    info "Modify Windows"
 
     # https://learn.microsoft.com/windows-hardware/manufacture/desktop/windows-setup-states
     # https://learn.microsoft.com/troubleshoot/azure/virtual-machines/reset-local-password-without-agent
@@ -2229,6 +2287,7 @@ restore_resolv_conf() {
 
 modify_linux() {
     os_dir=$1
+    info "Modify Linux"
 
     find_and_mount() {
         mount_point=$1
@@ -2275,8 +2334,8 @@ EOF
             ! sh /can_use_cloud_kernel.sh "$xda" $eths; then
 
             cp_resolv_conf $os_dir
-            chroot $os_dir apt update
-            DEBIAN_FRONTEND=noninteractive chroot $os_dir apt install -y linux-image-$axx64
+            chroot $os_dir apt-get update
+            DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y linux-image-$axx64
 
             # 标记云内核包
             # apt-mark showmanual 结果为空，返回值也是 0
@@ -2291,12 +2350,12 @@ EOF
 
         if [ "$releasever" -le 11 ]; then
             cp_resolv_conf $os_dir
-            chroot $os_dir apt update
+            chroot $os_dir apt-get update
 
             if true; then
                 # 将 debian 11 设置为 12 一样的网络管理器
                 # 可解决 ifupdown dhcp 不支持 24位掩码+不规则网关的问题
-                DEBIAN_FRONTEND=noninteractive chroot $os_dir apt install -y netplan.io
+                DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y netplan.io
                 chroot $os_dir systemctl disable networking resolvconf
                 chroot $os_dir systemctl enable systemd-networkd systemd-resolved
                 rm_resolv_conf $os_dir
@@ -2310,7 +2369,7 @@ EOF
 
             else
                 # debian 11 默认不支持 rdnss，要安装 rdnssd 或者 nm
-                DEBIAN_FRONTEND=noninteractive chroot $os_dir apt install -y rdnssd
+                DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y rdnssd
                 # 不会自动建立链接，因此不能删除
                 restore_resolv_conf $os_dir
             fi
@@ -2388,6 +2447,7 @@ EOF
 
 modify_os_on_disk() {
     only_process=$1
+    info "Modify disk if is $only_process"
 
     update_part
 
@@ -2481,6 +2541,47 @@ allow_root_password_login() {
     fi
 }
 
+change_root_password() {
+    os_dir=$1
+
+    info 'change root password'
+
+    pam_d=$os_dir/etc/pam.d
+
+    [ -f $pam_d/chpasswd ] && has_pamd_chpasswd=true || has_pamd_chpasswd=false
+
+    if $has_pamd_chpasswd; then
+        cp $pam_d/chpasswd $pam_d/chpasswd.orig
+
+        # cat /etc/pam.d/chpasswd
+        # @include common-password
+
+        # cat /etc/pam.d/chpasswd
+        # #%PAM-1.0
+        # auth       include      system-auth
+        # account    include      system-auth
+        # password   substack     system-auth
+        # -password   optional    pam_gnome_keyring.so use_authtok
+        # password   substack     postlogin
+
+        # 通过 /etc/pam.d/chpasswd 找到 /etc/pam.d/system-auth 或者 /etc/pam.d/system-auth
+        # 再找到有 password 和 pam_unix.so 的行，并删除 use_authtok，写入 /etc/pam.d/chpasswd
+        files=$(cat $pam_d/chpasswd | grep -E '^(password|@include)' | awk '{print $NF}' | sort -u)
+        for file in $files; do
+            if [ -f "$pam_d/$file" ] && line=$(grep ^password "$pam_d/$file" | grep -F pam_unix.so); then
+                echo "$line" | sed 's/use_authtok//' >$pam_d/chpasswd
+                break
+            fi
+        done
+    fi
+
+    echo "root:$PASSWORD" | chroot $os_dir chpasswd
+
+    if $has_pamd_chpasswd; then
+        mv $pam_d/chpasswd.orig $pam_d/chpasswd
+    fi
+}
+
 disable_selinux_kdump() {
     os_dir=$1
 
@@ -2508,7 +2609,6 @@ disable_selinux_kdump() {
     # yum reinstall kernel-core     # 重新安装新内核
     # cat /boot/loader/entries/*    # 依然有 crashkernel=1G-4G:192M,4G-64G:256M,64G-:512M
 
-    sed -i 's/crashkernel=[^ ]*/crashkernel=no/' $os_dir/etc/default/grub
     chroot $os_dir grubby --update-kernel ALL --args crashkernel=no
     # el7 上面那条 grubby 命令不能设置 /etc/default/grub
     sed -i 's/crashkernel=[^ "]*/crashkernel=no/' $os_dir/etc/default/grub
@@ -2519,16 +2619,19 @@ disable_selinux_kdump() {
 
 download_qcow() {
     apk add qemu-img
+    info "Download qcow2 image"
 
     mkdir -p /installer
     mount /dev/disk/by-label/installer /installer
 
     qcow_file=/installer/cloud_image.qcow2
-    if [ "$distro" = openeuler ]; then
-        prog=xz
-        apk add wget $prog
-        command wget $img -O- --tries=5 --progress=bar:force | $prog -dc >$qcow_file
+    if [ -n "$img_type_warp" ]; then
+        # 边下载边解压，单线程下载
+        # 用官方 wget ，带进度条
+        apk add wget
+        wget $img -O- | pipe_extract >$qcow_file
     else
+        # 多线程下载
         download "$img" "$qcow_file"
     fi
 }
@@ -2566,7 +2669,7 @@ get_os_fs() {
     esac
 }
 
-get_ci_installer_part_size() {
+get_cloud_image_part_size() {
     # 8
     # https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2 600m
     # https://download.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2 1.8g
@@ -2598,7 +2701,7 @@ get_ci_installer_part_size() {
         else
             echo 2GiB
         fi
-    elif get_http_file_size_to size_bytes $img >&2 && [ -n "$size_bytes" ]; then
+    elif size_bytes=$(get_http_file_size "$img"); then
         # 额外 +100M 文件系统保留大小 和 qcow2 写入空间
         size_bytes_mb=$((size_bytes / 1024 / 1024 + 100))
         # 最少 1g ，因为可能要用作临时 swap
@@ -2643,7 +2746,7 @@ chroot_apt_autoremove() {
     }
 
     change_confs change
-    DEBIAN_FRONTEND=noninteractive chroot $os_dir apt autoremove --purge -y
+    DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get autoremove --purge -y
     change_confs restore
 }
 
@@ -2659,6 +2762,8 @@ del_default_user() {
 }
 
 install_qcow_by_copy() {
+    info "Install qcow2 by copy"
+
     mount_nouuid() {
         case "$(get_os_fs)" in
         ext4) mount "$@" ;;
@@ -2703,6 +2808,7 @@ install_qcow_by_copy() {
         os_part="mapper/$os_part"
     fi
 
+    info "qcow2 Partitions"
     lsblk -f /dev/nbd0 -o +PARTTYPE
     echo "Part OS:   $os_part"
     echo "Part EFI:  $efi_part"
@@ -2794,6 +2900,8 @@ install_qcow_by_copy() {
     swapon /dev/$xda*3
 
     modify_el_ol() {
+        info "Modify el ol"
+
         # resolv.conf
         cp_resolv_conf /os
 
@@ -2951,6 +3059,7 @@ EOF
 
     modify_ubuntu() {
         os_dir=/os
+        info "Modify Ubuntu"
 
         cp_resolv_conf $os_dir
 
@@ -2987,8 +3096,8 @@ EOF
         # 安装最佳内核
         flavor=$(get_ubuntu_kernel_flavor)
         echo "Use kernel flavor: $flavor"
-        chroot $os_dir apt update
-        DEBIAN_FRONTEND=noninteractive chroot $os_dir apt install -y "linux-image-$flavor"
+        chroot $os_dir apt-get update
+        DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y "linux-image-$flavor"
 
         # 自带内核：
         # 常规版本             generic
@@ -3009,7 +3118,7 @@ EOF
         # 16.04 镜像用 ifupdown/networking 管理网络
         # 要安装 resolveconf，不然 /etc/resolv.conf 为空
         if [ "$releasever" = 16.04 ]; then
-            chroot $os_dir apt install -y resolvconf
+            chroot $os_dir apt-get install -y resolvconf
             ln -sf /run/resolvconf/resolv.conf $os_dir/etc/resolv.conf.orig
         fi
 
@@ -3091,6 +3200,8 @@ EOF
 }
 
 dd_qcow() {
+    info "DD qcow2"
+
     if true; then
         connect_qcow
 
@@ -3184,6 +3295,8 @@ resize_after_install_cloud_image() {
     # 1 修复 vultr 512m debian 11 generic/genericcloud 首次启动 kernel panic
     # 2 修复 gentoo websync 时空间不足
     if [ "$distro" = debian ] || [ "$distro" = gentoo ]; then
+        info "Resize after install cloud image"
+
         apk add parted
         if fix_partition_table_by_parted 2>&1 | grep -q 'Fixing'; then
             system_part_num=$(parted /dev/$xda -m print | tail -1 | cut -d: -f1)
@@ -3222,6 +3335,8 @@ mount_part_basic_layout() {
 }
 
 mount_part_for_iso_installer() {
+    info "Mount part for iso installer"
+
     # 挂载主分区
     mkdir -p /os
     mount /dev/disk/by-label/os /os
@@ -3250,6 +3365,7 @@ get_dns_list_for_win() {
 
 create_win_set_netconf_script() {
     target=$1
+    info "Create win netconf script"
 
     if is_staticv4 || is_staticv6 || is_need_manual_set_dnsv6; then
         get_netconf_to mac_addr
@@ -3302,23 +3418,6 @@ EOF
 # lscpu 也可查看虚拟化环境，但 alpine on lightsail 运行结果为 Microsoft
 # 猜测 lscpu 只参考了 cpuid 没参考 dmi
 # virt-what 可能会输出多行结果，因此用 grep
-is_virt_contains() {
-    if [ -z "$_virt" ]; then
-        apk add virt-what
-        _virt=$(virt-what)
-        apk del virt-what
-    fi
-    echo "$_virt" | grep -Eiw "$1"
-}
-
-is_dmi_contains() {
-    if [ -z "$_dmi" ]; then
-        apk add dmidecode
-        _dmi=$(dmidecode)
-        apk del dmidecode
-    fi
-    echo "$_dmi" | grep -Eiw "$1"
-}
 
 get_aws_repo() {
     if is_in_china >&2; then
@@ -3374,7 +3473,39 @@ get_server_name_by_build_ver() {
     fi
 }
 
+is_nt_ver_ge() {
+    local orig sorted
+    orig=$(printf '%s\n' "$1" "$nt_ver")
+    sorted=$(echo "$orig" | sort -V)
+    [ "$orig" = "$sorted" ]
+}
+
+get_cloud_vendor() {
+    # busybox blkid 不显示 sr0 的 UUID
+    apk add lsblk
+
+    # http://git.annexia.org/?p=virt-what.git;a=blob;f=virt-what.in;hb=HEAD
+    # virt-what 可识别厂商 aws google_cloud alibaba_cloud alibaba_cloud-ebm
+    if is_dmi_contains "Amazon EC2" || is_virt_contains aws; then
+        echo aws
+    elif is_dmi_contains "Google Compute Engine" || is_dmi_contains "GoogleCloud" || is_virt_contains google_cloud; then
+        echo gcp
+    elif is_dmi_contains "OracleCloud"; then
+        echo oracle
+    elif is_dmi_contains "7783-7084-3265-9085-8269-3286-77"; then
+        echo azure
+    elif lsblk -o UUID,LABEL | grep -i 9796-932E | grep -iq config-2; then
+        echo ibm
+    elif is_dmi_contains 'Huawei Cloud'; then
+        echo huawei
+    elif is_dmi_contains 'Alibaba Cloud'; then
+        echo aliyun
+    fi
+}
+
 install_windows() {
+    info "Process windows iso"
+
     apk add wimlib
 
     download $iso /os/windows.iso
@@ -3469,6 +3600,8 @@ install_windows() {
         esac
     )
 
+    info "Windows image info"
+    echo "Image Name: $image_name"
     echo "NT Version: $nt_ver"
     echo "Build Version: $build_ver"
     echo "Product Type: $product_type"
@@ -3489,6 +3622,7 @@ install_windows() {
     # arch_wim   wiminfo                    x86  x86_64  ARM64
     # arch       virtio iso / unattend.xml  x86  amd64   arm64
     # arch_xdd   virtio msi / xen驱动       x86  x64
+    # arch_dd    华为云驱动                   32   64
 
     # 将 wim 的 arch 转为驱动和应答文件的 arch
     arch_wim=$(get_selected_image_prop Architecture | to_lower)
@@ -3496,29 +3630,77 @@ install_windows() {
     x86)
         arch=x86
         arch_xdd=x86
+        arch_dd=32
         ;;
     x86_64)
         arch=amd64
         arch_xdd=x64
+        arch_dd=64
         ;;
     arm64)
         arch=arm64
         arch_xdd= # xen 没有 arm64 驱动，# virtio 也没有 arm64 msi
+        arch_dd=  # 华为云没有 arm64 驱动
         ;;
     esac
 
-    # 驱动
-    drv=/os/drivers
-    mkdir -p $drv
+    add_drivers() {
+        info "Add drivers"
+
+        drv=/os/drivers
+        mkdir -p "$drv"         # 驱动下载临时文件夹
+        mkdir -p "/wim/drivers" # boot.wim 驱动文件夹
+
+        vendor="$(get_cloud_vendor)"
+
+        # 虚拟化驱动/通用驱动
+        if is_virt_contains kvm; then
+            # kvm
+            if [ "$vendor" = aliyun ] && is_nt_ver_ge 6.1 && [ "$arch_wim" = x86_64 ]; then
+                add_driver_aliyun_kvm
+                # 未测试是否需要专用驱动
+            elif false && [ "$vendor" = huawei ] && is_nt_ver_ge 6.0 && { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
+                add_driver_huawei_kvm
+            else
+                # 兜底
+                add_driver_generic_kvm
+            fi
+        elif is_virt_contains xen; then
+            # xen
+            # generic_xen 兜底，但未签名，暂停使用
+            if is_nt_ver_ge 6.1 && [ "$arch_wim" = x86_64 ]; then
+                add_driver_aws_xen
+            elif is_nt_ver_ge 6.0 && { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
+                add_driver_citrix_xen
+            fi
+        fi
+
+        # 厂商驱动
+        case "$vendor" in
+        aws)
+            if is_nt_ver_ge 6.1 && { [ "$arch_wim" = x86_64 ] || [ "$arch_wim" = arm64 ]; }; then
+                add_driver_aws
+            fi
+            ;;
+        azure)
+            # inf 不限版本，未测试
+            if [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; then
+                add_driver_azure
+            fi
+            ;;
+        gcp)
+            # inf 不限版本，6.0 能装但用不了
+            # x86 x86_64 arm64 都有
+            add_driver_gcp
+            ;;
+        esac
+    }
 
     # aws nitro
-    # 不支持 vista
     # https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html
     # https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html
-    if is_virt_contains aws &&
-        is_virt_contains kvm &&
-        { [ "$arch_wim" = x86_64 ] || [ "$arch_wim" = arm64 ]; } &&
-        ! [ "$nt_ver" = 6.0 ]; then
+    add_driver_aws() {
+        info "Add drivers: AWS"
 
         # 未打补丁的 win7 无法使用 sha256 签名的驱动
         nvme_ver=$(
@@ -3544,13 +3726,13 @@ install_windows() {
 
         unzip -o -d $drv/aws/ $drv/AWSNVMe.zip
         unzip -o -d $drv/aws/ $drv/AwsEnaNetworkDriver.zip
-    fi
+
+        cp_drivers $drv/aws
+    }
 
     # citrix xen
-    # 仅支持 vista
-    if is_virt_contains xen &&
-        { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; } &&
-        [ "$nt_ver" = 6.0 ]; then
+    add_driver_citrix_xen() {
+        info "Add drivers: Citrix Xen"
 
         apk add 7zip
         download https://s3.amazonaws.com/ec2-downloads-windows/Drivers/Citrix-Win_PV.zip $drv/Citrix-Win_PV.zip
@@ -3561,15 +3743,15 @@ install_windows() {
         esac
         # 排除 $PLUGINSDIR $TEMP
         exclude='$*'
-        7z x $drv/Citrix_xensetup.exe -o$drv/aws/ -ao$override -x!$exclude
-    fi
+        7z x $drv/Citrix_xensetup.exe -o$drv/xen/ -ao$override -x!$exclude
+
+        cp_drivers $drv/xen
+    }
 
     # aws xen
-    # 不支持 vista
     # https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html
-    if is_virt_contains xen &&
-        [ "$arch_wim" = x86_64 ] &&
-        ! [ "$nt_ver" = 6.0 ]; then
+    add_driver_aws_xen() {
+        info "Add drivers: AWS Xen"
 
         apk add msitools
 
@@ -3587,7 +3769,9 @@ install_windows() {
         msiextract $drv/AWSPVDriverSetup.msi -C $drv
         mkdir -p $drv/aws/
         cp -rf $drv/.Drivers/* $drv/aws/
-    fi
+
+        cp_drivers $drv/xen -ipath "*/$arch_xdd/*"
+    }
 
     # xen
     # 没签名，暂时用aws的驱动代替
@@ -3595,9 +3779,8 @@ install_windows() {
     # https://xenbits.xenproject.org/pvdrivers/win/
     # 在 aws t2 上测试，安装 xenbus 会蓝屏，装了其他7个驱动后，能进系统但没网络
     # 但 aws 应该用aws官方xen驱动，所以测试仅供参考
-    if false &&
-        is_virt_contains xen &&
-        { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
+    add_driver_generic_xen() {
+        info "Add drivers: Generic Xen"
 
         parts='xenbus xencons xenhid xeniface xennet xenvbd xenvif xenvkbd'
         mkdir -p $drv/xen/
@@ -3605,13 +3788,14 @@ install_windows() {
             download https://xenbits.xenproject.org/pvdrivers/win/$part.tar $drv/$part.tar
             tar -xf $drv/$part.tar -C $drv/xen/
         done
-    fi
 
-    # kvm (排除 aws)
-    # x86 x86_64 arm64 都有
+        cp_drivers $drv/xen
+    }
+
+    # kvm
     # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
-    if is_virt_contains kvm &&
-        ! is_virt_contains aws; then
+    add_driver_generic_kvm() {
+        info "Add drivers: Generic KVM"
 
         # 要区分 win10 / win11 驱动，虽然他们的 NT 版本号都是 10.0，但驱动文件有区别
         # https://github.com/virtio-win/kvm-guest-drivers-windows/commit/9af43da9e16e2d4bf4ea4663cdc4f29275fff48f
@@ -3651,6 +3835,13 @@ install_windows() {
             download $baseurl/$dir/virtio-win.iso $drv/virtio.iso
             mkdir -p $drv/virtio
             mount -o ro $drv/virtio.iso $drv/virtio
+
+            if [ "$nt_ver" = 6.0 ] || [ "$nt_ver" = 6.1 ]; then
+                # vista/7 气球驱动有问题
+                cp_drivers $drv/virtio -ipath "*/$virtio_sys/$arch/*" -not -ipath "*/balloon/*"
+            else
+                cp_drivers $drv/virtio -ipath "*/$virtio_sys/$arch/*"
+            fi
         else
             # coreutils 的 cp mv rm 才有 -v 参数
             apk add 7zip file coreutils
@@ -3658,9 +3849,9 @@ install_windows() {
             match="FILE_*_${virtio_sys}_${arch}*"
             7z x $drv/virtio.msi -o$drv/virtio -i!$match -y -bb1
 
+            # 为没有后缀名的文件添加后缀名
             (
                 cd $drv/virtio
-                # 为没有后缀名的文件添加后缀名
                 echo "Recognizing file extension..."
                 for file in *"${virtio_sys}_${arch}"; do
                     recognized=false
@@ -3696,12 +3887,100 @@ install_windows() {
                     mv -v "$file" "$new_file"
                 done
             )
+            # 虽然 vista/7 气球驱动有问题，但 msi 里面没有 vista/7 驱动
+            # 因此不用额外处理
+            cp_drivers $drv/virtio
         fi
-    fi
+    }
+
+    add_driver_huawei_kvm() {
+        info "Add drivers: Huawei KVM"
+
+        huawei_sys=$(
+            case "$(echo "$product_ver" | to_lower)" in
+            vista) echo Vista2008 ;;
+            7) echo 7 ;;
+            8) [ "$arch_wim" = x86 ] && echo 7 || echo 2012 ;;      # 没有 win8 32/64
+            8.1) [ "$arch_wim" = x86 ] && echo 7 || echo 2012_R2 ;; # 没有 win8.1 32/64
+            10 | 11) echo 10 ;;
+            2008) echo Vista2008 ;;
+            '2008 r2') echo 2008_R2 ;;
+            2012) [ "$arch_wim" = x86 ] && echo 2008_R2 || echo 2012 ;; # 没有 2012 32
+            '2012 r2') echo 2012_R2 ;;
+            2016 | 2019 | 202*) echo 2016 ;;
+            esac
+        )
+
+        download https://ecs-instance-driver.obs.cn-north-1.myhuaweicloud.com/vmtools-windows.zip $drv/vmtools-windows.zip
+        unzip -o -d $drv $drv/vmtools-windows.zip
+        mkdir -p $drv/huawei
+        mount -o ro $drv/vmtools-windows.iso $drv/huawei
+
+        cp_drivers $drv/huawei -ipath "*/upgrade/windows ${huawei_sys}_${arch_dd}/drivers/*"
+    }
+
+    add_driver_aliyun_kvm() {
+        info "Add drivers: Aliyun KVM"
+
+        # win7 旧驱动是 sha1 签名
+        if [ "$nt_ver" = 6.1 ]; then
+            # 旧驱动
+            aliyun_sys=$(
+                case "$nt_ver" in
+                6.1) echo 7 ;;
+                6.2 | 6.3) echo 8 ;;
+                *) echo 10 ;;
+                esac
+            )
+
+            filename=$(
+                case "$nt_ver" in
+                6.1) echo 210408.1454.1459_bin.zip ;; # sha1
+                *) echo 220915.0953.0953_bin.zip ;;   # sha256
+                # *) echo new_virtio.zip ;;
+                esac
+            )
+
+            region=$(
+                if is_in_china; then
+                    echo cn-beijing
+                else
+                    echo us-west-1
+                fi
+            )
+
+            download https://windows-driver-$region.oss-$region.aliyuncs.com/virtio/$filename $drv/aliyun.zip
+            unzip -o -d $drv/aliyun/ $drv/aliyun.zip
+
+            # 注意文件夹是 win7 Win8 win10 大小写不一致
+            cp_drivers $drv/aliyun -ipath "*/win${aliyun_sys}/${arch}/*"
+        else
+            # 新驱动
+            aliyun_sys=$(
+                case "$nt_ver" in
+                6.1) echo 2008R2 ;;       # sha256
+                6.2 | 6.3) echo 2012R2 ;; # 实际上是 2012 的驱动
+                *) echo 2016 ;;
+                esac
+            )
+
+            region=cn-hangzhou
+
+            download https://windows-driver-$region.oss-$region.aliyuncs.com/virtio/AliyunVirtio_WIN$aliyun_sys.zip $drv/AliyunVirtio.zip
+            unzip -o -d $drv $drv/AliyunVirtio.zip
+
+            apk add innoextract
+            innoextract -d $drv/aliyun/ $drv/AliyunVirtio_*_WIN${aliyun_sys}_$arch_xdd.exe
+            apk del innoextract
+
+            cp_drivers $drv/aliyun -ipath "*/C$/Program Files/AliyunVirtio/*/drivers/*"
+        fi
+    }
 
     # gcp
     # x86 x86_64 arm64 都有
-    if { is_dmi_contains "Google Compute Engine" || is_dmi_contains "GoogleCloud"; }; then
+    add_driver_gcp() {
+        info "Add drivers: GCP"
 
         gce_repo=https://packages.cloud.google.com/yuck
         download $gce_repo/repos/google-compute-engine-stable/index /tmp/gce.json
@@ -3726,16 +4005,21 @@ install_windows() {
                 done
             fi
         done
-    fi
+
+        [ "$arch_wim" = x86 ] && gvnic_suffix=-32 || gvnic_suffix=
+        cp_drivers $drv/gce/gvnic -ipath "*/win$nt_ver$gvnic_suffix/*"
+        cp_drivers $drv/gce/gga -ipath "*/win$nt_ver/*"
+    }
 
     # azure
     # https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows
-    if is_dmi_contains "7783-7084-3265-9085-8269-3286-77" &&
-        { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
+    add_driver_azure() {
+        info "Add drivers: Azure"
 
         download https://aka.ms/manawindowsdrivers $drv/azure.zip
         unzip $drv/azure.zip -d $drv/azure/
-    fi
+        cp_drivers $drv/azure
+    }
 
     # 修改应答文件
     download $confhome/windows.xml /tmp/autounattend.xml
@@ -3779,6 +4063,7 @@ install_windows() {
     fi
 
     # 挂载 boot.wim
+    info "mount boot.wim"
     mkdir -p /wim
     wimmountrw /os/boot.wim 2 /wim/
 
@@ -3795,31 +4080,7 @@ install_windows() {
     }
 
     # 添加驱动
-    mkdir -p /wim/drivers
-    [ -d $drv/virtio ] && {
-        if [ "$virtio_source" = iso ]; then
-            # iso
-            if [ "$nt_ver" = 6.0 ]; then
-                # win7 气球驱动有问题
-                cp_drivers $drv/virtio -ipath "*/$virtio_sys/$arch/*" -not -ipath "*/balloon/*"
-            else
-                cp_drivers $drv/virtio -ipath "*/$virtio_sys/$arch/*"
-            fi
-        else
-            # msi
-            # 虽然 win7 气球驱动有问题，但 msi 里面没有 win7 驱动
-            # 因此不用额外处理
-            cp_drivers $drv/virtio
-        fi
-    }
-    [ -d $drv/aws ] && cp_drivers $drv/aws
-    [ -d $drv/xen ] && cp_drivers $drv/xen -ipath "*/$arch_xdd/*"
-    [ -d $drv/azure ] && cp_drivers $drv/azure
-    [ -d $drv/gce ] && {
-        [ "$arch_wim" = x86 ] && gvnic_suffix=-32 || gvnic_suffix=
-        cp_drivers $drv/gce/gvnic -ipath "*/win$nt_ver$gvnic_suffix/*"
-        cp_drivers $drv/gce/gga -ipath "*/win$nt_ver/*"
-    }
+    add_drivers
 
     # win7 要添加 bootx64.efi 到 efi 目录
     [ $arch = amd64 ] && boot_efi=bootx64.efi || boot_efi=bootaa64.efi
@@ -3834,7 +4095,11 @@ install_windows() {
     xmlstarlet ed -d '//comment()' /tmp/autounattend.xml >/wim/autounattend.xml
     apk del xmlstarlet
     unix2dos /wim/autounattend.xml
-    cat /wim/autounattend.xml
+    info "autounattend.xml"
+    cat -n /wim/autounattend.xml
+
+    # 避免无参数运行 setup.exe 时自动安装
+    mv /wim/autounattend.xml /wim/windows.xml
 
     # 复制安装脚本
     # https://slightlyovercomplicated.com/2016/11/07/windows-pe-startup-sequence-explained/
@@ -3848,6 +4113,7 @@ install_windows() {
     download $confhome/windows-setup.bat $system32_dir/startnet.cmd
 
     # 提交修改 boot.wim
+    info "Unmount boot.wim"
     wimunmount --commit /wim/
 
     # 优化 boot.wim 大小
@@ -3874,6 +4140,7 @@ install_windows() {
     # 所以复制 resize.bat 到 install.wim
     # TODO: 由于esd文件无法修改，要将resize.bat放到boot.wim
     if [[ "$install_wim" = '*.wim' ]]; then
+        info "mount install.wim"
         wimmountrw $install_wim "$image_name" /wim/
         if false; then
             # 使用 autounattend.xml
@@ -3885,6 +4152,8 @@ install_windows() {
         else
             modify_windows /wim
         fi
+
+        info "Unmount install.wim"
         wimunmount --commit /wim/
     fi
 
@@ -3910,6 +4179,7 @@ EOF
 # 添加 netboot.efi 备用
 download_netboot_xyz_efi() {
     dir=$1
+    info "download netboot.xyz.efi"
 
     file=$dir/netboot.xyz.efi
     if [ "$(uname -m)" = aarch64 ]; then
@@ -3935,41 +4205,36 @@ get_ubuntu_kernel_flavor() {
     # 24.04 kvm = virtual
     # linux-image-virtual = linux-image-6.x-generic
     # linux-image-generic = linux-image-6.x-generic + amd64-microcode + intel-microcode + linux-firmware + linux-modules-extra-generic
+
+    # TODO: ISO virtual-hwe-24.04 不安装 linux-image-extra-virtual-hwe-24.04 不然会花屏
+
     # https://github.com/systemd/systemd/blob/main/src/basic/virt.c
     # https://github.com/canonical/cloud-init/blob/main/tools/ds-identify
     # http://git.annexia.org/?p=virt-what.git;a=blob;f=virt-what.in;hb=HEAD
-    {
-        # busybox blkid 不显示 sr0 的 UUID
-        if [ "$releasever" = 16.04 ]; then
-            if is_virt; then
-                flavor=virtual-hwe-$releasever
-            else
-                flavor=generic-hwe-$releasever
-            fi
+    if [ "$releasever" = 16.04 ]; then
+        if is_virt; then
+            echo virtual-hwe-$releasever
         else
-            apk add lsblk
-
-            if is_dmi_contains "amazon" || is_dmi_contains "ec2"; then
-                flavor=aws
-            elif is_dmi_contains "Google Compute Engine" || is_dmi_contains "GoogleCloud"; then
-                flavor=gcp
-            elif is_dmi_contains "OracleCloud"; then
-                flavor=oracle
-            elif is_dmi_contains "7783-7084-3265-9085-8269-3286-77"; then
-                flavor=azure
-            elif lsblk -o UUID,LABEL | grep -i 9796-932E | grep -i config-2; then
-                flavor=ibm
-            elif is_virt; then
-                flavor=virtual-hwe-$releasever
-            else
-                flavor=generic-hwe-$releasever
-            fi
+            echo generic-hwe-$releasever
         fi
-    } >&2
-    echo $flavor
+    else
+        vendor="$(get_cloud_vendor)"
+        case "$vendor" in
+        aws | gcp | oracle | azure | ibm) echo $vendor ;;
+        *)
+            if is_virt; then
+                echo virtual-hwe-$releasever
+            else
+                echo generic-hwe-$releasever
+            fi
+            ;;
+        esac
+    fi
 }
 
 install_redhat_ubuntu() {
+    info "Download iso installer"
+
     # 安装 grub2
     if is_efi; then
         # 注意低版本的grub无法启动f38 arm的内核
@@ -4002,8 +4267,29 @@ install_redhat_ubuntu() {
     # shellcheck disable=SC2154
     if [ "$distro" = "ubuntu" ]; then
         download $iso /os/installer/ubuntu.iso
+        mkdir -p /iso
+        mount -o ro /os/installer/ubuntu.iso /iso
 
+        # 内核风味
         kernel=$(get_ubuntu_kernel_flavor)
+
+        # 要安装的版本
+        # https://canonical-subiquity.readthedocs-hosted.com/en/latest/reference/autoinstall-reference.html#id
+        # 20.04 不能选择 minimal ，也没有 install-sources.yaml
+        source_id=
+        if [ -f /iso/casper/install-sources.yaml ]; then
+            ids=$(grep id: /iso/casper/install-sources.yaml | awk '{print $2}')
+            if [ "$(echo "$ids" | wc -l)" = 1 ]; then
+                source_id=$ids
+            else
+                [ "$minimal" = 1 ] && v= || v=-v
+                source_id=$(echo "$ids" | grep $v '\-minimal')
+
+                if [ "$(echo "$source_id" | wc -l)" -gt 1 ]; then
+                    error_and_exit "find multi source id."
+                fi
+            fi
+        fi
 
         # 正常写法应该是 ds="nocloud-net;s=https://xxx/" 但是甲骨文云的ds更优先，自己的ds根本无访问记录
         # $seed 是 https://xxx/
@@ -4015,7 +4301,7 @@ install_redhat_ubuntu() {
             insmod all_video
             search --no-floppy --label --set=root installer
             loopback loop /ubuntu.iso
-            linux (loop)/casper/vmlinuz iso-scan/filename=/ubuntu.iso autoinstall noprompt noeject cloud-config-url=$ks $extra_cmdline extra_kernel=$kernel --- $console_cmdline
+            linux (loop)/casper/vmlinuz iso-scan/filename=/ubuntu.iso autoinstall noprompt noeject cloud-config-url=$ks $extra_cmdline extra_kernel=$kernel extra_source_id=$source_id --- $console_cmdline
             initrd (loop)/casper/initrd
         }
 EOF
@@ -4039,6 +4325,8 @@ EOF
 }
 
 trans() {
+    info "start trans"
+
     mod_motd
 
     # 先检查 modloop 是否正常
@@ -4065,6 +4353,7 @@ trans() {
     fi
 
     # dd qemu 切换成云镜像模式，暂时没用到
+    # shellcheck disable=SC2154
     if [ "$distro" = "dd" ] && [ "$img_type" = "qemu" ]; then
         # 移到 reinstall.sh ?
         distro=any
@@ -4093,8 +4382,8 @@ trans() {
                 ;;
             esac
             ;;
-        gzip | xz | raw)
-            # 暂时没用到 gzip xz 格式的云镜像
+        raw)
+            # 暂时没用到 raw 格式的云镜像
             dd_gzip_xz_raw
             resize_after_install_cloud_image
             modify_os_on_disk linux
@@ -4102,7 +4391,7 @@ trans() {
         esac
     elif [ "$distro" = "dd" ]; then
         case "$img_type" in
-        gzip | xz | raw)
+        raw)
             dd_gzip_xz_raw
             modify_os_on_disk windows
             ;;
@@ -4138,10 +4427,10 @@ trans() {
     # 因此 alpine 不单独处理
     if is_efi; then
         del_invalid_efi_entry
-        add_fallback_efi_to_nvram
+        add_default_efi_to_nvram
     fi
 
-    echo 'done'
+    info 'done'
     # 让 web 输出全部内容
     sleep 5
 }
@@ -4170,6 +4459,7 @@ extract_env_from_cmdline
 # 带参数运行部分
 # 重新下载并 exec 运行新脚本
 if [ "$1" = "update" ]; then
+    info 'update script'
     # shellcheck disable=SC2154
     wget -O /trans.sh "$confhome/trans.sh"
     chmod +x /trans.sh
@@ -4191,6 +4481,7 @@ printf '\nyes' | setup-sshd
 # shellcheck disable=SC2154
 if [ "$hold" = 1 ]; then
     if is_run_from_locald; then
+        info "hold"
         exit
     fi
 fi
@@ -4213,6 +4504,7 @@ case 1 in
 esac
 
 if [ "$hold" = 2 ]; then
+    info "hold 2"
     exit
 fi
 

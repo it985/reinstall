@@ -7,6 +7,9 @@ confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
 confhome_cn=https://jihulab.com/bin456789/reinstall/-/raw/main
 # confhome_cn=https://mirror.ghproxy.com/https://raw.githubusercontent.com/bin456789/reinstall/main
 
+# 用于判断 reinstall.sh 和 trans.sh 是否兼容
+SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0001
+
 # https://www.gnu.org/software/gettext/manual/html_node/The-LANGUAGE-variable.html
 export LC_ALL=C
 
@@ -16,8 +19,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
 # 记录日志
 exec > >(exec tee /reinstall.log) 2>&1
-
-this_script=$(readlink -f "$0")
+THIS_SCRIPT=$(readlink -f "$0")
 trap 'trap_err $LINENO $?' ERR
 
 trap_err() {
@@ -25,7 +27,7 @@ trap_err() {
     ret_no=$2
 
     error "Line $line_no return $ret_no"
-    sed -n "$line_no"p "$this_script"
+    sed -n "$line_no"p "$THIS_SCRIPT"
 }
 
 usage_and_exit() {
@@ -131,12 +133,20 @@ is_use_cloud_image() {
     [ -n "$cloud_image" ] && [ "$cloud_image" = 1 ]
 }
 
+is_force_use_installer() {
+    [ -n "$installer" ] && [ "$installer" = 1 ]
+}
+
 is_use_dd() {
     [ "$distro" = dd ]
 }
 
+is_boot_in_separate_partition() {
+    mount | grep -q ' on /boot type '
+}
+
 is_os_in_btrfs() {
-    mount | grep -qw 'on / type btrfs'
+    mount | grep -q ' on / type btrfs '
 }
 
 is_os_in_subvol() {
@@ -228,7 +238,7 @@ test_url_grace() {
 test_url_real() {
     grace=$1
     url=$2
-    expect_type=$3
+    expect_types=$3
     var_to_eval=$4
     info test url
 
@@ -241,14 +251,15 @@ test_url_real() {
 
     # TODO: 好像无法识别 nixos 官方源的跳转
     # 有的服务器不支持 range，curl会下载整个文件
-    # 用 dd 限制下载 1M
-    # 并过滤 curl 23 错误（dd限制了空间）
+    # 所以用 head 限制 1M
+    # 过滤 curl 23 错误（head 限制了大小）
     # 也可用 ulimit -f 但好像 cygwin 不支持
+    # ${PIPESTATUS[n]} 表示第n个管道的返回值
     echo $url
     for i in $(seq 5 -1 0); do
         if command curl --insecure --connect-timeout 10 -Lfr 0-1048575 "$url" \
-            1> >(dd bs=1M count=1 of=$tmp_file iflag=fullblock 2>/dev/null) \
-            2> >(grep -v 'curl: (23)' >&2); then
+            1> >(exec head -c 1048576 >$tmp_file) \
+            2> >(exec grep -v 'curl: (23)' >&2); then
             break
         else
             ret=$?
@@ -262,21 +273,74 @@ test_url_real() {
         fi
     done
 
-    if [ -n "$expect_type" ]; then
-        # gzip的mime有很多种写法
-        # centos7中显示为 x-gzip，在其他系统中显示为 gzip，可能还有其他
-        # 所以不用mime判断
-        # https://www.digipres.org/formats/sources/tika/formats/#application/gzip
-
-        # 有些 file 版本输出的是 # ISO 9660 CD-ROM filesystem data ，要去掉开头的井号
+    # 如果要检查文件类型
+    if [ -n "$expect_types" ]; then
         install_pkg file
-        real_type=$(file -b $tmp_file | sed 's/^# //' | cut -d' ' -f1 | to_lower)
-        [ -n "$var_to_eval" ] && eval $var_to_eval=$real_type
+        real_type=$(file_enhanced $tmp_file)
+        echo "$real_type"
 
-        if ! grep -wo "$real_type" <<<"$expect_type"; then
-            failed "$url expected: $expect_type. actual: $real_type."
+        # 期待值没有.表示要只需判断外侧
+        if ! grep -Fq . <<<"$expect_types"; then
+            real_type=$(echo "$real_type" | cut -d. -f2-)
+        fi
+
+        # 检查
+        if ! grep -Foq "|$real_type|" <<<"|$expect_types|"; then
+            failed "$url
+expected: $expect_types
+actually: $real_type"
         fi
     fi
+
+    # 如果要设置变量
+    if [ -n "$var_to_eval" ]; then
+        IFS=. read -r "${var_to_eval?}" "${var_to_eval}_warp" <<<"$real_type"
+    fi
+}
+
+fix_file_type() {
+    # gzip的mime有很多种写法
+    # centos7中显示为 x-gzip，在其他系统中显示为 gzip，可能还有其他
+    # 所以不用mime判断
+    # https://www.digipres.org/formats/sources/tika/formats/#application/gzip
+
+    # --extension 不靠谱
+    # file -b /reinstall-tmp/img-test --mime-type
+    # application/x-qemu-disk
+    # file -b /reinstall-tmp/img-test --extension
+    # ???
+
+    # 有些 file 版本输出的是 # ISO 9660 CD-ROM filesystem data ，要去掉开头的井号
+
+    # 下面两种都是 raw
+    # DOS/MBR boot sector
+    # x86 boot sector; partition 1: ...
+
+    sed 's/^# //' | awk '{print $1}' | to_lower |
+        sed -e 's,dos/mbr,raw,' -e 's,x86,raw,'
+}
+
+file_enhanced() {
+    local file=$1
+    local outside inside
+
+    outside=$(file -b $file | fix_file_type)
+
+    if [ "$outside" = "xz" ] || [ "$outside" = "gzip" ]; then
+        # 要安装 xz 或者 gzip，不然会报错
+        # ERROR:[xz: Wait failed, No child process]
+        install_pkg "$outside"
+
+        # 加 if 是为了避免以下情况（外面是xz，但是识别不到里面的东西，即使装了xz）,
+        # 即使 file 报错返回值也是 0
+        # [root@localhost ~]# file -bZ /reinstall-tmp/img-test
+        # ERROR:[xz: Unexpected end of input]
+        if inside="$(file -bZ $file | fix_file_type)" && ! grep -iq "^Error" <<<"$inside"; then
+            echo "$inside.$outside"
+            return
+        fi
+    fi
+    echo "$outside"
 }
 
 add_community_repo_for_alpine() {
@@ -802,6 +866,19 @@ setos() {
                     directory=extended-lts
                     initrd_mirror=archive.debian.org
                 fi
+                if is_in_china; then
+                    warn "
+Due to the lack of Debian Freexian ELTS instaler mirrors in China, the installation time may be longer.
+Continue?
+
+由于没有 Debian Freexian ELTS 国内安装源，安装时间可能会比较长。
+继续安装?
+"
+                    read -r -p '[y/N]: '
+                    if ! [[ "$REPLY" = [Yy] ]]; then
+                        exit
+                    fi
+                fi
             else
                 if is_in_china; then
                     # ftp.cn.debian.org 不在国内还严重丢包
@@ -928,11 +1005,12 @@ setos() {
             filename=$(curl -L $mirror | grep -oP "ubuntu-$releasever.*?-live-server-$basearch_alt.iso" | head -1)
             iso=$mirror/$filename
             # 在 ubuntu 20.04 上，file 命令检测 ubuntu 22.04 iso 结果是 DOS/MBR boot sector
-            test_url $iso 'iso|dos/mbr'
+            test_url $iso 'iso|raw'
             eval ${step}_iso=$iso
 
             # ks
             eval ${step}_ks=$confhome/ubuntu.yaml
+            eval ${step}_minimal=$minimal
         fi
     }
 
@@ -979,7 +1057,7 @@ setos() {
             # 传统安装
             # 该服务器文件缓存 miss 时会响应 206 + Location 头
             # 但 curl 这种情况不会重定向，所以添加 ascii 类型让它不要报错
-            test_url $mirror/nixos-$releasever/store-paths.xz xz/ascii
+            test_url $mirror/nixos-$releasever/store-paths.xz 'xz|ascii'
             eval ${step}_mirror=$mirror
         fi
     }
@@ -1046,7 +1124,7 @@ setos() {
         if [ -z "$iso" ]; then
             # 查找时将 windows longhorn serverdatacenter 改成 windows server 2008 serverdatacenter
             image_name=${image_name/windows longhorn server/windows server 2008 server}
-            echo "iso url is not set. Try to find it."
+            echo "iso url is not set. Attempting to find it automatically."
             find_windows_iso
         fi
 
@@ -1055,38 +1133,30 @@ setos() {
         # 注意 windows server 2008 r2 serverdatacenter 不用改
         image_name=${image_name/windows server 2008 server/windows longhorn server}
 
-        test_url $iso 'iso|dos/mbr'
+        test_url $iso 'iso|raw'
         eval "${step}_iso='$iso'"
         eval "${step}_image_name='$image_name'"
     }
 
     # shellcheck disable=SC2154
     setos_dd() {
-        # 下面两种都是 raw
-        # DOS/MBR boot sector
-        # x86 boot sector; partition 1: ...
-        test_url $img 'xz|gzip|dos/mbr|x86' img_type
-
-        # 修正 raw 的 img_type
-        if [ "$img_type" = dos/mbr ] || [ "$img_type" = x86 ]; then
-            img_type=raw
-        fi
+        # raw 包含 vhd
+        test_url $img 'raw|raw.gzip|raw.xz' img_type
 
         if is_efi; then
             install_pkg hexdump
 
-            if ! [ "$img_type" = raw ]; then
-                install_pkg $img_type
-            fi
-
             extract() {
-                if [ "$img_type" = raw ]; then
-                    cat "$1"
-                else
+                case "$img_type_warp" in
+                '') cat "$1" ;;
+                xz | gzip)
+                    install_pkg $img_type_warp
                     # xz/gzip -d 文件必须有正确的扩展名，否则报扩展名错误
                     # 因此用 stdin
-                    $img_type -dc <"$1"
-                fi
+                    "$img_type_warp" -dc <"$1"
+                    ;;
+                *) error_and_exit "warp type $img_type_warp not support." ;;
+                esac
             }
 
             # openwrt 镜像 efi part type 不是 esp
@@ -1120,6 +1190,7 @@ Continue with DD?
         fi
         eval "${step}_img='$img'"
         eval "${step}_img_type='$img_type'"
+        eval "${step}_img_type_warp='$img_type_warp'"
     }
 
     setos_centos_alma_rocky_fedora() {
@@ -1287,13 +1358,7 @@ Continue with DD?
     # 集中测试云镜像格式
     if is_use_cloud_image && [ "$step" = finalos ]; then
         # shellcheck disable=SC2154
-        test_url $finalos_img 'xz|gzip|qemu' finalos_img_type
-
-        # openeuler 云镜像格式是 .qcow2.xz
-        if [ "$distro" = openeuler ]; then
-            # shellcheck disable=SC2034
-            finalos_img_type=qemu
-        fi
+        test_url $finalos_img 'qemu|qemu.gzip|qemu.xz' finalos_img_type
     fi
 }
 
@@ -1394,7 +1459,7 @@ install_pkg() {
                 # https://github.com/chef/os_release
                 case "$id" in
                 fedora | centos | rhel) is_have_cmd dnf && pkg_mgr=dnf || pkg_mgr=yum ;;
-                debian | ubuntu) pkg_mgr=apt ;;
+                debian | ubuntu) pkg_mgr=apt-get ;;
                 opensuse | suse) pkg_mgr=zypper ;;
                 alpine) pkg_mgr=apk ;;
                 arch) pkg_mgr=pacman ;;
@@ -1407,7 +1472,7 @@ install_pkg() {
         fi
 
         # 查找方法 2
-        for mgr in dnf yum apt pacman zypper emerge apk opkg nix-env; do
+        for mgr in dnf yum apt-get pacman zypper emerge apk opkg nix-env; do
             is_have_cmd $mgr && pkg_mgr=$mgr && return
         done
 
@@ -1424,7 +1489,7 @@ install_pkg() {
             ;;
         xz)
             case "$pkg_mgr" in
-            apt) pkg="xz-utils" ;;
+            apt-get) pkg="xz-utils" ;;
             *) pkg="xz" ;;
             esac
             ;;
@@ -1442,14 +1507,14 @@ install_pkg() {
             ;;
         fdisk)
             case "$pkg_mgr" in
-            apt) pkg="fdisk" ;;
+            apt-get) pkg="fdisk" ;;
             apk) pkg="util-linux-misc" ;;
             *) pkg="util-linux" ;;
             esac
             ;;
         hexdump)
             case "$pkg_mgr" in
-            apt) pkg="bsdmainutils" ;;
+            apt-get) pkg="bsdmainutils" ;;
             *) pkg="util-linux" ;;
             esac
             ;;
@@ -1462,7 +1527,7 @@ install_pkg() {
             ;;
         nslookup | dig)
             case "$pkg_mgr" in
-            apt) pkg="dnsutils" ;;
+            apt-get) pkg="dnsutils" ;;
             pacman) pkg="bind" ;;
             apk | emerge) pkg="bind-tools" ;;
             yum | dnf | zypper) pkg="bind-utils" ;;
@@ -1529,9 +1594,9 @@ install_pkg() {
             add_community_repo_for_alpine
             apk add $pkg
             ;;
-        apt)
-            [ -z "$apt_updated" ] && apt update && apt_updated=1
-            DEBIAN_FRONTEND=noninteractive apt install -y $pkg
+        apt-get)
+            [ -z "$apt_updated" ] && apt-get update && apt_updated=1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkg
             ;;
         opkg)
             [ -z "$opkg_updated" ] && opkg update && opkg_updated=1
@@ -1575,7 +1640,7 @@ install_pkg() {
             cmd_to_pkg
             install_pkg_real
         fi
-    done
+    done >&2
 }
 
 check_ram() {
@@ -1681,13 +1746,27 @@ is_secure_boot_enabled() {
     fi
 }
 
-is_use_grub() {
+is_need_grub_extlinux() {
     ! { is_netboot_xyz && is_efi; }
 }
 
-# 只有 linux bios 是用本机的 grub
+# 只有 linux bios 是用本机的 grub/extlinux
+is_use_local_grub_extlinux() {
+    is_need_grub_extlinux && ! is_in_windows && ! is_efi
+}
+
 is_use_local_grub() {
-    is_use_grub && ! is_in_windows && ! is_efi
+    is_use_local_grub_extlinux && is_mbr_using_grub
+}
+
+is_use_local_extlinux() {
+    is_use_local_grub_extlinux && ! is_mbr_using_grub
+}
+
+is_mbr_using_grub() {
+    find_main_disk
+    # 各发行版不一定自带 strings hexdump xxd od 命令
+    head -c 440 /dev/$xda | grep --text -iq 'GRUB'
 }
 
 to_upper() {
@@ -2198,6 +2277,29 @@ install_grub_win() {
         bcdedit /set $id path \\g2ldr
         bcdedit /displayorder $id /addlast
         bcdedit /bootsequence $id /addfirst
+    fi
+}
+
+find_grub_extlinux_cfg() {
+    dir=$1
+    filename=$2
+    keyword=$3
+
+    # 当 ln -s /boot/grub /boot/grub2 时
+    # find /boot/ 会自动忽略 /boot/grub2 里面的文件
+    cfgs=$(
+        # 只要 $dir 存在
+        # 无论是否找到结果，返回值都是 0
+        find $dir \
+            -type f -name $filename \
+            -exec grep -E -l "$keyword" {} \;
+    )
+
+    count="$(wc -l <<<"$cfgs")"
+    if [ "$count" -eq 1 ]; then
+        echo "$cfgs"
+    else
+        error_and_exit "Find $count $filename."
     fi
 }
 
@@ -2817,6 +2919,11 @@ mod_initrd() {
         $(is_in_windows && echo --nonmatching 'dev/console' --nonmatching 'dev/null')
 
     curl -Lo $initrd_dir/trans.sh $confhome/trans.sh
+    if ! grep -i "$SCRIPT_VERSION" $initrd_dir/trans.sh; then
+        error_and_exit "
+This script is outdated, please download reinstall.sh again.
+脚本有更新，请重新下载 reinstall.sh"
+    fi
     curl -Lo $initrd_dir/alpine-network.sh $confhome/alpine-network.sh
     chmod a+x $initrd_dir/trans.sh $initrd_dir/alpine-network.sh
 
@@ -2924,7 +3031,7 @@ else
 fi
 
 # 整理参数
-if ! opts=$(getopt -n $0 -o "" --long ci,debug,minimal,hold:,sleep:,iso:,image-name:,img:,lang:,commit:,force: -- "$@"); then
+if ! opts=$(getopt -n $0 -o "" --long ci,installer,debug,minimal,hold:,sleep:,iso:,image-name:,img:,lang:,commit:,force: -- "$@"); then
     usage_and_exit
 fi
 
@@ -2942,6 +3049,12 @@ while true; do
         ;;
     --ci)
         cloud_image=1
+        unset installer
+        shift
+        ;;
+    --installer)
+        installer=1
+        unset cloud_image
         shift
         ;;
     --minimal)
@@ -3016,11 +3129,18 @@ case "$distro" in
 dd | windows | netboot.xyz | kali | alpine | arch | gentoo | nixos)
     if is_use_cloud_image; then
         echo "ignored --ci"
-        cloud_image=0
+        unset cloud_image
     fi
     ;;
-redhat | centos | alma | rocky | oracle | ubuntu | fedora | opensuse | anolis | opencloudos | openeuler)
+oracle | opensuse | anolis | opencloudos | openeuler)
     cloud_image=1
+    ;;
+redhat | centos | alma | rocky | fedora | ubuntu)
+    if is_force_use_installer; then
+        unset cloud_image
+    else
+        cloud_image=1
+    fi
     ;;
 esac
 
@@ -3160,7 +3280,7 @@ if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
 fi
 
 # 将内核/netboot.xyz.lkrn 放到正确的位置
-if false && is_use_grub; then
+if false && is_need_grub_extlinux; then
     if is_in_windows; then
         cp -f /reinstall-vmlinuz /cygdrive/$c/
         is_have_initrd && cp -f /reinstall-initrd /cygdrive/$c/
@@ -3172,8 +3292,8 @@ if false && is_use_grub; then
     fi
 fi
 
-# grub
-if is_use_grub; then
+# grub / extlinux
+if is_need_grub_extlinux; then
     # win 使用外部 grub
     if is_in_windows; then
         install_grub_win
@@ -3186,9 +3306,7 @@ if is_use_grub; then
         fi
     fi
 
-    info 'create grub config'
-
-    # 寻找 grub.cfg
+    # 寻找 grub.cfg / extlinux.conf
     if is_in_windows; then
         if is_efi; then
             grub_cfg=/cygdrive/$c/grub.cfg
@@ -3203,28 +3321,25 @@ if is_use_grub; then
             efi_reinstall_dir=$(find $(get_maybe_efi_dirs_in_linux) -type d -name "reinstall" | head -1)
             grub_cfg=$efi_reinstall_dir/grub.cfg
         else
-            if is_have_cmd update-grub; then
-                # alpine debian ubuntu
-                grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
-            else
-                # 找出主配置文件（含有menuentry|blscfg）
-                # 现在 efi 用下载的 grub，因此不需要查找 efi 目录
-                grub_cfg=$(
-                    find /boot/grub* \
-                        -type f -name grub.cfg \
-                        -exec grep -E -l 'menuentry|blscfg' {} \;
-                )
-
-                if [ "$(wc -l <<<"$grub_cfg")" -gt 1 ]; then
-                    error_and_exit 'find multi grub.cfg files.'
+            if is_mbr_using_grub; then
+                if is_have_cmd update-grub; then
+                    # alpine debian ubuntu
+                    grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
+                else
+                    # 找出主配置文件（含有menuentry|blscfg）
+                    # 现在 efi 用下载的 grub，因此不需要查找 efi 目录
+                    grub_cfg=$(find_grub_extlinux_cfg '/boot/grub*' grub.cfg 'menuentry|blscfg')
                 fi
+            else
+                # extlinux
+                extlinux_cfg=$(find_grub_extlinux_cfg /boot extlinux.conf LINUX)
             fi
         fi
     fi
 
     # 判断用 linux 还是 linuxefi（主要是红帽系）
     # 现在 efi 用下载的 grub，因此不需要判断 linux 或 linuxefi
-    if false && is_use_local_grub; then
+    if false && is_use_local_grub_extlinux; then
         # 在x86 efi机器上，不同版本的 grub 可能用 linux 或 linuxefi 加载内核
         # 通过检测原有的条目有没有 linuxefi 字样就知道当前 grub 用哪一种
         # 也可以检测 /etc/grub.d/10_linux
@@ -3264,7 +3379,14 @@ if is_use_grub; then
         fi
     fi
 
-    # 选择用 custom.cfg (linux-bios) 还是 grub.cfg (win/linux-efi)
+    # 重新生成 extlinux.conf
+    if is_use_local_extlinux; then
+        if is_have_cmd update-extlinux; then
+            update-extlinux
+        fi
+    fi
+
+    # 选择用 custom.cfg (linux-bios) 还是 grub.cfg (linux-efi / win)
     if is_use_local_grub; then
         target_cfg=$(dirname $grub_cfg)/custom.cfg
     else
@@ -3276,16 +3398,22 @@ if is_use_grub; then
         # dir=/cygwin/
         dir=$(cygpath -m / | cut -d: -f2-)/
     else
-        # 获取当前系统根目录在 btrfs 中的绝对路径
-        if is_os_in_btrfs; then
-            # btrfs subvolume show /
-            # 输出可能是 / 或 root 或 @/.snapshots/1/snapshot
-            dir=$(btrfs subvolume show / | head -1)
-            if ! [ "$dir" = / ]; then
-                dir="/$dir/"
-            fi
+        # extlinux + 单独的 boot 分区
+        # 把内核文件放在 extlinux.conf 所在的目录
+        if is_use_local_extlinux && is_boot_in_separate_partition; then
+            dir=
         else
-            dir=/
+            # 获取当前系统根目录在 btrfs 中的绝对路径
+            if is_os_in_btrfs; then
+                # btrfs subvolume show /
+                # 输出可能是 / 或 root 或 @/.snapshots/1/snapshot
+                dir=$(btrfs subvolume show / | head -1)
+                if ! [ "$dir" = / ]; then
+                    dir="/$dir/"
+                fi
+            else
+                dir=/
+            fi
         fi
     fi
 
@@ -3293,62 +3421,105 @@ if is_use_grub; then
     initrd=${dir}reinstall-initrd
     firmware=${dir}reinstall-firmware
 
-    # 生成 linux initrd 命令
-    if is_netboot_xyz; then
-        linux_cmd="linux16 $vmlinuz"
+    # 设置 linux initrd 命令
+    if is_use_local_extlinux; then
+        linux_cmd=LINUX
+        initrd_cmd=INITRD
     else
-        find_main_disk
-        build_cmdline
-        linux_cmd="linux$efi $vmlinuz $cmdline"
-        initrd_cmd="initrd$efi $initrd"
-        if is_use_firmware; then
-            initrd_cmd+=" $firmware"
+        if is_netboot_xyz; then
+            linux_cmd=linux16
+            initrd_cmd=initrd16
+        else
+            linux_cmd="linux$efi"
+            initrd_cmd="initrd$efi"
         fi
     fi
 
-    # cloudcone 从光驱的 grub 启动，再加载硬盘的 grub.cfg
-    # menuentry "Grub 2" --id grub2 {
-    #         set root=(hd0,msdos1)
-    #         configfile /boot/grub2/grub.cfg
-    # }
+    # 设置 cmdlind initrds
+    if ! is_netboot_xyz; then
+        find_main_disk
+        build_cmdline
 
-    # 加载后 $prefix 依然是光驱的 (hd96)/boot/grub
-    # 导致找不到 $prefix 目录的 grubenv，因此读取不到 next_entry
-    # 以下方法为 cloudcone 重新加载 grubenv
-
-    # 需查找 2*2 个文件夹
-    # 分区：系统 / boot
-    # 文件夹：grub / grub2
-    # shellcheck disable=SC2121,SC2154
-    # cloudcone debian 能用但 ubuntu 模板用不了
-    # ubuntu 模板甚至没显示 reinstall menuentry
-    load_grubenv_if_not_loaded() {
-        if ! [ -s $prefix/grubenv ]; then
-            for dir in /boot/grub /boot/grub2 /grub /grub2; do
-                set grubenv="($root)$dir/grubenv"
-                if [ -s $grubenv ]; then
-                    load_env --file $grubenv
-                    if [ "${next_entry}" ]; then
-                        set default="${next_entry}"
-                        set next_entry=
-                        save_env --file $grubenv next_entry
-                    else
-                        set default="0"
-                    fi
-                    return
-                fi
-            done
+        initrds="$initrd"
+        if is_use_firmware; then
+            initrds+=" $firmware"
         fi
-    }
+    fi
 
-    # 生成 grub 配置
-    # 实测 centos 7 lvm 要手动加载 lvm 模块
-    echo $target_cfg
+    if is_use_local_extlinux; then
+        info extlinux
+        echo $extlinux_cfg
+        extlinux_dir="$(dirname $extlinux_cfg)"
 
-    get_function_content load_grubenv_if_not_loaded >$target_cfg
+        # 不起作用
+        # 好像跟 extlinux --once 有冲突
+        sed -i "/^MENU HIDDEN/d" $extlinux_cfg
+        sed -i "/^TIMEOUT /d" $extlinux_cfg
 
-    # 原系统为 openeuler 云镜像，需要添加 --unrestricted，否则要输入密码
-    del_empty_lines <<EOF | tee -a $target_cfg
+        del_empty_lines <<EOF | tee -a $extlinux_cfg
+TIMEOUT 5
+LABEL reinstall
+  MENU LABEL $(get_entry_name)
+  $linux_cmd $vmlinuz
+  $([ -n "$initrds" ] && echo "$initrd_cmd $initrds")
+  $([ -n "$cmdline" ] && echo "APPEND $cmdline")
+EOF
+        # 设置重启引导项
+        extlinux --once=reinstall $extlinux_dir
+
+        # 复制文件到 extlinux 工作目录
+        if is_boot_in_separate_partition; then
+            info "copying files to $extlinux_dir"
+            is_have_initrd && cp -f /reinstall-initrd $extlinux_dir
+            is_use_firmware && cp -f /reinstall-firmware $extlinux_dir
+            # 放最后，防止前两条返回非 0 而报错
+            cp -f /reinstall-vmlinuz $extlinux_dir
+        fi
+    else
+        # cloudcone 从光驱的 grub 启动，再加载硬盘的 grub.cfg
+        # menuentry "Grub 2" --id grub2 {
+        #         set root=(hd0,msdos1)
+        #         configfile /boot/grub2/grub.cfg
+        # }
+
+        # 加载后 $prefix 依然是光驱的 (hd96)/boot/grub
+        # 导致找不到 $prefix 目录的 grubenv，因此读取不到 next_entry
+        # 以下方法为 cloudcone 重新加载 grubenv
+
+        # 需查找 2*2 个文件夹
+        # 分区：系统 / boot
+        # 文件夹：grub / grub2
+        # shellcheck disable=SC2121,SC2154
+        # cloudcone debian 能用但 ubuntu 模板用不了
+        # ubuntu 模板甚至没显示 reinstall menuentry
+        load_grubenv_if_not_loaded() {
+            if ! [ -s $prefix/grubenv ]; then
+                for dir in /boot/grub /boot/grub2 /grub /grub2; do
+                    set grubenv="($root)$dir/grubenv"
+                    if [ -s $grubenv ]; then
+                        load_env --file $grubenv
+                        if [ "${next_entry}" ]; then
+                            set default="${next_entry}"
+                            set next_entry=
+                            save_env --file $grubenv next_entry
+                        else
+                            set default="0"
+                        fi
+                        return
+                    fi
+                done
+            fi
+        }
+
+        # 生成 grub 配置
+        # 实测 centos 7 lvm 要手动加载 lvm 模块
+        info grub
+        echo $target_cfg
+
+        get_function_content load_grubenv_if_not_loaded >$target_cfg
+
+        # 原系统为 openeuler 云镜像，需要添加 --unrestricted，否则要输入密码
+        del_empty_lines <<EOF | tee -a $target_cfg
 set timeout_style=menu
 set timeout=5
 menuentry "$(get_entry_name)" --unrestricted {
@@ -3356,14 +3527,15 @@ menuentry "$(get_entry_name)" --unrestricted {
     $(is_os_in_btrfs && echo 'set btrfs_relative_path=n')
     insmod all_video
     search --no-floppy --file --set=root $vmlinuz
-    $linux_cmd
-    $initrd_cmd
+    $linux_cmd $vmlinuz $cmdline
+    $([ -n "$initrds" ] && echo "$initrd_cmd $initrds")
 }
 EOF
 
-    # 设置重启引导项
-    if is_use_local_grub; then
-        $grub-reboot "$(get_entry_name)"
+        # 设置重启引导项
+        if is_use_local_grub; then
+            $grub-reboot "$(get_entry_name)"
+        fi
     fi
 fi
 

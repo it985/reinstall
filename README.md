@@ -149,10 +149,35 @@ bash reinstall.sh centos      9
 > 安装其它系统时，可通过多种方式（SSH、HTTP 80 端口、后台 VNC、串行控制台）查看安装进度。
 > 即使安装过程出错，也能通过 SSH 安装到 Alpine。
 
+<details>
+
+<summary>实验性功能</summary>
+
+用云镜像安装 Debian，适合于 CPU 较慢的机器
+
+```bash
+bash reinstall.sh debian --ci
+```
+
+用 ISO 安装 CentOS, Alma, Rocky, Fedora ，仅支持内存大于 2G 且为动态 IP 的机器
+
+```bash
+bash reinstall.sh centos --installer
+```
+
+用 ISO 安装 Ubuntu ，仅支持内存大于 1G 且为动态 IP 的机器
+
+```bash
+bash reinstall.sh ubuntu --installer
+```
+
+</details>
+
 ### 功能 2: DD
 
-- 支持 `raw` `vhd` `gzip`、`xz` 格式的镜像
-- DD Windows 镜像时，会自动扩展系统盘。静态的机器会自动配置好 IP，可能首次开机几分钟后才生效
+- 支持 `raw` `vhd` 或者经过 `xz` `gzip` 压缩的镜像
+- DD Windows 镜像时，会扩展系统盘，静态 IP 的机器会配置好 IP，可能首次开机几分钟后才生效
+- DD Linux 镜像时，脚本不会修改镜像的任何内容
 
 ```bash
 bash reinstall.sh dd --img https://example.com/xxx.xz
@@ -217,7 +242,7 @@ bash reinstall.sh windows \
 <summary>以下网站可找到 iso 链接</summary>
 
 - <https://massgrave.dev/genuine-installation-media.html> (推荐，iso 来自官方，每月更新，包含最新补丁)
-- <https://www.microsoft.com/software-download/windows10> (需用手机 User-Agent 打开)
+- <https://www.microsoft.com/software-download/windows10> (需用非 Windows User-Agent 打开)
 - <https://www.microsoft.com/software-download/windows11>
 - <https://www.microsoft.com/software-download/windowsinsiderpreviewiso> (预览版)
 - <https://www.microsoft.com/evalcenter/download-windows-10-enterprise>
@@ -261,7 +286,7 @@ Windows Server 2022 SERVERDATACENTER
 
 #### 脚本会按需安装以下驱动
 
-- KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/))
+- KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/)、[阿里云](https://www.alibabacloud.com/help/ecs/user-guide/update-red-hat-virtio-drivers-of-windows-instances))
 - XEN ([XEN](https://xenproject.org/windows-pv-drivers/)、[Citrix](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Upgrading_PV_drivers.html#win2008-citrix-upgrade)、[AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/xen-drivers-overview.html))
 - AWS ([ENA 网卡](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ena-driver-releases-windows.html)、[NVME 存储控制器](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvme-driver-version-history.html))
 - GCP ([gVNIC 网卡](https://cloud.google.com/compute/docs/networking/using-gvnic)、[GGA 显卡](https://cloud.google.com/compute/docs/instances/enable-instance-virtual-display))

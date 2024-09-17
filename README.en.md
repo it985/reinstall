@@ -13,7 +13,7 @@ One-Click Script to Reinstall System [中文](README.md)
 - Supports installation of 17 common Linux distributions
 - Supports installation of official Windows ISO, automatically finds ISO links, and integrates virtual machine drivers
 - Supports installation in any direction, i.e., `Linux to Linux`, `Linux to Windows`, `Windows to Windows`, `Windows to Linux`
-- No need to input IP parameters; automatically recognizes dynamic and static IPs, supports `/32`, `/128`, `gateway outside subnet`, `pure IPv6`, `dual NIC` and other special network configurations
+- No need to input IP parameters; automatically recognizes dynamic and static IPs, supports `/32`, `/128`, `gateway outside subnet`, `IPv6 only`, `dual NIC` and other special network configurations
 - Specially optimized for low-spec servers, requires less memory than the official netboot
 - Uses partition table ID to identify hard drives throughout the process, ensuring no wrong disk is written
 - Supports BIOS and EFI boot, and ARM architecture
@@ -149,10 +149,35 @@ bash reinstall.sh centos      9
 > When installing other systems, can monitor the progress through various methods (SSH, HTTP 80 port, VNC in the background, serial console).
 > Even if errors occur during the installation process, you can still install Alpine via SSH.
 
+<details>
+
+<summary>Experimental Features</summary>
+
+Install Debian using a cloud image, suitable for machines with slower CPUs
+
+```bash
+bash reinstall.sh debian --ci
+```
+
+Install CentOS, Alma, Rocky, Fedora using ISO, only supports machines with more than 2G of memory and dynamic IP
+
+```bash
+bash reinstall.sh centos --installer
+```
+
+Install Ubuntu using ISO, only supports machines with more than 1G of memory and dynamic IP
+
+```bash
+bash reinstall.sh ubuntu --installer
+```
+
+</details>
+
 ### Feature 2: DD
 
-- Supports `raw` `vhd` `gzip` and `xz` formatted images
-- When using DD with a Windows image, the script will automatically expand the system partition. For static IP machines, the IP will be configured automatically, and it may take a few minutes to take effect on first boot
+- Supports `raw`, `vhd` images or those compressed with `xz` or `gzip`.
+- When deploy a Windows image, the system disk will be expanded, and machines with static IPs will have their IPs configured. However, it may take a few minutes after the first boot for the configuration to take effect.
+- When deploy a Linux image, the script will not modify any contents of the image.
 
 ```bash
 bash reinstall.sh dd --img https://example.com/xxx.xz
@@ -217,7 +242,7 @@ bash reinstall.sh windows \
 <summary>The following website provides iso links.</summary>
 
 - <https://massgrave.dev/genuine-installation-media.html> (Recommended, iso sourced from official channels, updated monthly, includes the latest patches)
-- <https://www.microsoft.com/software-download/windows10> (Need to open it with a mobile User-Agent)
+- <https://www.microsoft.com/software-download/windows10> (Need to open it with a non-Windows User-Agent)
 - <https://www.microsoft.com/software-download/windows11>
 - <https://www.microsoft.com/software-download/windowsinsiderpreviewiso> (Preview)
 - <https://www.microsoft.com/evalcenter/download-windows-10-enterprise>
@@ -261,7 +286,7 @@ Use `Dism++` File menu > Open Image File, select the iso to be installed to get 
 
 #### The script will install the following drivers as needed
 
-- KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/))
+- KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/), [Alibaba Cloud](https://www.alibabacloud.com/help/ecs/user-guide/update-red-hat-virtio-drivers-of-windows-instances))
 - XEN ([XEN](https://xenproject.org/windows-pv-drivers/), [Citrix](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Upgrading_PV_drivers.html#win2008-citrix-upgrade), [AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/xen-drivers-overview.html))
 - AWS ([ENA Network Adapter](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ena-driver-releases-windows.html), [NVMe Storage Controller](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvme-driver-version-history.html))
 - GCP ([gVNIC Network Adapter](https://cloud.google.com/compute/docs/networking/using-gvnic), [GGA Graphics](https://cloud.google.com/compute/docs/instances/enable-instance-virtual-display))
