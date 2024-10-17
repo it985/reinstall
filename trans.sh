@@ -1,6 +1,6 @@
 #!/bin/ash
 # shellcheck shell=dash
-# shellcheck disable=SC2086,SC3047,SC3036,SC3010,SC3001
+# shellcheck disable=SC2086,SC3047,SC3036,SC3010,SC3001,SC3060
 # alpine 默认使用 busybox ash
 
 # 出错后停止运行，将进入到登录界面，防止失联
@@ -8,10 +8,7 @@ set -eE
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 # shellcheck disable=SC2034
-SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0001
-
-# debian 安装版、ubuntu 安装版、el/ol 安装版不使用该密码
-PASSWORD=123@@@
+SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0002
 
 TRUE=0
 FALSE=1
@@ -75,7 +72,8 @@ wget() {
     echo "$@" | grep -o 'http[^ ]*' >&2
     if command wget 2>&1 | grep -q BusyBox; then
         # busybox wget 没有重试功能
-        retry 5 command wget "$@"
+        # 好像默认永不超时
+        retry 5 command wget "$@" -T 10
     else
         # 原版 wget 自带重试功能
         command wget --tries=5 --progress=bar:force "$@"
@@ -215,11 +213,20 @@ is_use_cloud_image() {
     [ -n "$cloud_image" ] && [ "$cloud_image" = 1 ]
 }
 
+is_allow_ping() {
+    [ -n "$allow_ping" ] && [ "$allow_ping" = 1 ]
+}
+
 setup_nginx() {
     apk add nginx
     # shellcheck disable=SC2154
     wget $confhome/logviewer.html -O /logviewer.html
     wget $confhome/logviewer-nginx.conf -O /etc/nginx/http.d/default.conf
+
+    if [ -z "$web_port" ]; then
+        web_port=80
+    fi
+    sed -i "s/@WEB_PORT@/$web_port/gi" /etc/nginx/http.d/default.conf
 
     # rc-service nginx start
     if pgrep nginx >/dev/null; then
@@ -380,22 +387,31 @@ clear_previous() {
     # mount /1/file2 /2
 }
 
+# virt-what 自动安装 dmidecode，因此同时缓存
 cache_dmi_and_virt() {
-    if [ -z "$_dmi" ] || [ -z "$_virt" ]; then
-        # virt-what 自动安装 dmidecode
+    if ! [ "$_dmi_and_virt_cached" = 1 ]; then
         apk add virt-what
 
         # 区分 kvm 和 virtio，原因:
         # 1. 阿里云 c8y virt-what 不显示 kvm
         # 2. 不是所有 kvm 都需要 virtio 驱动，例如 aws nitro
+        # 3. virt-what 不会检测 virtio
+        _virt=$(
+            virt-what
 
-        # virt-what 不会检测 virtio
-        _virt=$(virt-what)
-        if [ -d /sys/bus/virtio ]; then
-            _virt=$({ echo "$_virt" && echo virtio; } | sort -u)
-        fi
+            # hyper-v 环境下 modprobe virtio_scsi 也会创建 /sys/bus/virtio/drivers
+            # 因此用 devices 判断更准确，有设备时才有 devices
+            # 或者加上 lspci 检测?
+
+            # 不要用 [ -d /sys/bus/virtio/devices ] && echo virtio
+            # 因为非 virtio 时返回值不为 0
+            if [ -d /sys/bus/virtio/devices ]; then
+                echo virtio
+            fi
+        )
 
         _dmi=$(dmidecode | grep -E '(Manufacturer|Asset Tag|Vendor): ' | awk -F': ' '{print $2}')
+        _dmi_and_virt_cached=1
         apk del virt-what
     fi
 }
@@ -420,6 +436,40 @@ is_dmi_contains() {
     # Asset Tag: Amazon EC2
     cache_dmi_and_virt
     echo "$_dmi" | grep -Eiwq "$1"
+}
+
+cache_lspci() {
+    if [ -z "$_lspci" ]; then
+        apk add pciutils
+        _lspci=$(lspci)
+        apk del pciutils
+    fi
+}
+
+is_lspci_contains() {
+    cache_lspci
+    echo "$_lspci" | grep -Eiwq "$1"
+}
+
+get_config() {
+    cat "/configs/$1"
+}
+
+get_password_linux_sha512() {
+    get_config password-linux-sha512
+}
+
+get_password_windows_administrator_base64() {
+    get_config password-windows-administrator-base64
+}
+
+# debian 安装版、ubuntu 安装版、el/ol 安装版不使用该密码
+get_password_plaintext() {
+    get_config password-plaintext
+}
+
+is_password_plaintext() {
+    get_password_plaintext >/dev/null 2>&1
 }
 
 show_netconf() {
@@ -575,6 +625,14 @@ is_windows_support_rdnss() {
         fi
     done
     error_and_exit "Not found kernel32.dll"
+}
+
+is_need_change_ssh_port() {
+    [ -n "$ssh_port" ] && ! [ "$ssh_port" = 22 ]
+}
+
+is_need_change_rdp_port() {
+    [ -n "$rdp_port" ] && ! [ "$rdp_port" = 3389 ]
 }
 
 is_need_manual_set_dnsv6() {
@@ -1320,6 +1378,9 @@ install_nixos() {
     if [ -e /os/swapfile ] && $keep_swap; then
         nix_swap="swapDevices = [{ device = \"/swapfile\"; size = $swap_size; }];"
     fi
+    if is_need_change_ssh_port; then
+        nix_ssh_ports="services.openssh.ports = [ $ssh_port ];"
+    fi
 
     # TODO: 准确匹配网卡，添加 udev 或者直接配置 networkd 匹配 mac
     create_nixos_network_config /tmp/nixos_network_config.nix
@@ -1332,6 +1393,7 @@ $nix_substituters
 boot.kernelParams = [ $(get_ttys console= | quote_word) ];
 services.openssh.enable = true;
 services.openssh.settings.PermitRootLogin = "yes";
+$nix_ssh_ports
 $(cat /tmp/nixos_network_config.nix)
 ###################################################
 EOF
@@ -1377,8 +1439,8 @@ EOF
     nixos-install --root /os --no-root-passwd -j $threads
 
     # 设置密码
-    echo "root:$PASSWORD" | nixos-enter --root /os -- \
-        /run/current-system/sw/bin/chpasswd
+    echo "root:$(get_password_linux_sha512)" | nixos-enter --root /os -- \
+        /run/current-system/sw/bin/chpasswd -e
 
     # 设置 channel
     if is_in_china; then
@@ -1632,6 +1694,9 @@ EOF
     chroot $os_dir systemctl enable systemd-resolved
     chroot $os_dir systemctl enable sshd
     allow_root_password_login $os_dir
+    if is_need_change_ssh_port; then
+        change_ssh_port $os_dir $ssh_port
+    fi
 
     # 修改密码
     change_root_password $os_dir
@@ -2133,7 +2198,16 @@ download_cloud_init_config() {
     sed -i '1!{/^[[:space:]]*#/d}' $ci_file
 
     # 修改密码
-    sed -i "s/@PASSWORD@/$PASSWORD/" $ci_file
+    # 不能用 sed 替换，因为含有特殊字符
+    content=$(cat $ci_file)
+    echo "${content//@PASSWORD@/$(get_password_linux_sha512)}" >$ci_file
+
+    # 修改 ssh 端口
+    if is_need_change_ssh_port; then
+        sed -i "s/@SSH_PORT@/$ssh_port/g" $ci_file
+    else
+        sed -i "/@SSH_PORT@/d" $ci_file
+    fi
 
     # swapfile
     # 如果分区表中已经有swapfile就跳过，例如arch
@@ -2179,10 +2253,27 @@ modify_windows() {
         use_gpo=false
     fi
 
-    # 下载共同的子脚本
+    # bat 列表
+    bats=
+
+    # 1. rdp 端口
+    if is_need_change_rdp_port; then
+        create_win_change_rdp_port_script $os_dir/windows-change-rdp-port.bat "$rdp_port"
+        bats="$bats windows-change-rdp-port.bat"
+    fi
+
+    # 2. 允许 ping
+    if is_allow_ping; then
+        download $confhome/windows-allow-ping.bat $os_dir/windows-allow-ping.bat
+        bats="$bats windows-allow-ping.bat"
+    fi
+
+    # 3. 合并分区
     # 可能 unattend.xml 已经设置了ExtendOSPartition，不过运行resize没副作用
-    bats="windows-resize.bat"
     download $confhome/windows-resize.bat $os_dir/windows-resize.bat
+    bats="$bats windows-resize.bat"
+
+    # 4. 网络设置
     for ethx in $(get_eths); do
         create_win_set_netconf_script $os_dir/windows-set-netconf-$ethx.bat
         bats="$bats windows-set-netconf-$ethx.bat"
@@ -2418,9 +2509,9 @@ EOF
         cp_resolv_conf $os_dir
 
         # 在这里修改密码，而不是用cloud-init，因为我们的默认密码太弱
-        sed -i 's/enforce=everyone/enforce=none/' $os_dir/etc/security/passwdqc.conf
-        echo "root:$PASSWORD" | chroot $os_dir chpasswd
-        sed -i 's/enforce=none/enforce=everyone/' $os_dir/etc/security/passwdqc.conf
+        is_password_plaintext && sed -i 's/enforce=everyone/enforce=none/' $os_dir/etc/security/passwdqc.conf
+        echo "root:$(get_password_linux_sha512)" | chroot $os_dir chpasswd -e
+        is_password_plaintext && sed -i 's/enforce=none/enforce=everyone/' $os_dir/etc/security/passwdqc.conf
 
         # 下载仓库，选择 profile
         chroot $os_dir emerge-webrsync
@@ -2535,20 +2626,43 @@ create_swap() {
 }
 
 # arch gentoo 常规安装用
+change_ssh_conf() {
+    os_dir=$1
+    key=$2
+    value=$3
+    sub_conf=$4
+
+    # arch 没有 /etc/ssh/sshd_config.d/ 文件夹
+    # opensuse tumbleweed 有 /etc/ssh/sshd_config.d/ 文件夹，但没有 /etc/ssh/sshd_config，有/usr/etc/ssh/sshd_config
+    if grep -q 'Include.*/etc/ssh/sshd_config.d' $os_dir/etc/ssh/sshd_config ||
+        grep -q '^Include.*/etc/ssh/sshd_config.d/' $os_dir/usr/etc/ssh/sshd_config; then
+        mkdir -p $os_dir/etc/ssh/sshd_config.d/
+        echo "$key $value" >"$os_dir/etc/ssh/sshd_config.d/$sub_conf"
+    else
+        # 如果 sshd_config 存在此 key，则替换
+        # 否则追加
+        line="^#?$key .*"
+        if grep -x "$line" $os_dir/etc/ssh/sshd_config; then
+            sed -Ei "s/$line/$key $value/" $os_dir/etc/ssh/sshd_config
+        else
+            echo "$key $value" >>$os_dir/etc/ssh/sshd_config
+        fi
+    fi
+}
+
+# arch gentoo 常规安装用
 allow_root_password_login() {
     os_dir=$1
 
-    # 允许 root 密码登录
-    # arch 没有 /etc/ssh/sshd_config.d/ 文件夹
-    # opensuse tumbleweed 有 /etc/ssh/sshd_config.d/ 文件夹，但没有 /etc/ssh/sshd_config，但有/usr/etc/ssh/sshd_config
-    if grep 'Include.*/etc/ssh/sshd_config.d' $os_dir/etc/ssh/sshd_config; then
-        mkdir -p $os_dir/etc/ssh/sshd_config.d/
-        echo 'PermitRootLogin yes' >$os_dir/etc/ssh/sshd_config.d/01-permitrootlogin.conf
-    else
-        if ! grep -x 'PermitRootLogin yes' $os_dir/etc/ssh/sshd_config; then
-            echo 'PermitRootLogin yes' >>$os_dir/etc/ssh/sshd_config
-        fi
-    fi
+    change_ssh_conf "$os_dir" PermitRootLogin yes 01-permitrootlogin.conf
+}
+
+# arch gentoo 常规安装用
+change_ssh_port() {
+    os_dir=$1
+    ssh_port=$2
+
+    change_ssh_conf "$os_dir" Port "$ssh_port" 01-change-ssh-port.conf
 }
 
 change_root_password() {
@@ -2556,39 +2670,45 @@ change_root_password() {
 
     info 'change root password'
 
-    pam_d=$os_dir/etc/pam.d
+    if is_password_plaintext; then
+        pam_d=$os_dir/etc/pam.d
 
-    [ -f $pam_d/chpasswd ] && has_pamd_chpasswd=true || has_pamd_chpasswd=false
+        [ -f $pam_d/chpasswd ] && has_pamd_chpasswd=true || has_pamd_chpasswd=false
 
-    if $has_pamd_chpasswd; then
-        cp $pam_d/chpasswd $pam_d/chpasswd.orig
+        if $has_pamd_chpasswd; then
+            cp $pam_d/chpasswd $pam_d/chpasswd.orig
 
-        # cat /etc/pam.d/chpasswd
-        # @include common-password
+            # cat /etc/pam.d/chpasswd
+            # @include common-password
 
-        # cat /etc/pam.d/chpasswd
-        # #%PAM-1.0
-        # auth       include      system-auth
-        # account    include      system-auth
-        # password   substack     system-auth
-        # -password   optional    pam_gnome_keyring.so use_authtok
-        # password   substack     postlogin
+            # cat /etc/pam.d/chpasswd
+            # #%PAM-1.0
+            # auth       include      system-auth
+            # account    include      system-auth
+            # password   substack     system-auth
+            # -password   optional    pam_gnome_keyring.so use_authtok
+            # password   substack     postlogin
 
-        # 通过 /etc/pam.d/chpasswd 找到 /etc/pam.d/system-auth 或者 /etc/pam.d/system-auth
-        # 再找到有 password 和 pam_unix.so 的行，并删除 use_authtok，写入 /etc/pam.d/chpasswd
-        files=$(grep -E '^(password|@include)' $pam_d/chpasswd | awk '{print $NF}' | sort -u)
-        for file in $files; do
-            if [ -f "$pam_d/$file" ] && line=$(grep ^password "$pam_d/$file" | grep -F pam_unix.so); then
-                echo "$line" | sed 's/use_authtok//' >$pam_d/chpasswd
-                break
-            fi
-        done
-    fi
+            # 通过 /etc/pam.d/chpasswd 找到 /etc/pam.d/system-auth 或者 /etc/pam.d/system-auth
+            # 再找到有 password 和 pam_unix.so 的行，并删除 use_authtok，写入 /etc/pam.d/chpasswd
+            files=$(grep -E '^(password|@include)' $pam_d/chpasswd | awk '{print $NF}' | sort -u)
+            for file in $files; do
+                if [ -f "$pam_d/$file" ] && line=$(grep ^password "$pam_d/$file" | grep -F pam_unix.so); then
+                    echo "$line" | sed 's/use_authtok//' >$pam_d/chpasswd
+                    break
+                fi
+            done
+        fi
 
-    echo "root:$PASSWORD" | chroot $os_dir chpasswd
+        # 分两行写，不然遇到错误不会终止
+        plaintext=$(get_password_plaintext)
+        echo "root:$plaintext" | chroot $os_dir chpasswd
 
-    if $has_pamd_chpasswd; then
-        mv $pam_d/chpasswd.orig $pam_d/chpasswd
+        if $has_pamd_chpasswd; then
+            mv $pam_d/chpasswd.orig $pam_d/chpasswd
+        fi
+    else
+        echo "root:$(get_password_linux_sha512)" | chroot $os_dir chpasswd -e
     fi
 }
 
@@ -3418,6 +3538,17 @@ EOF
     unix2dos $target
 }
 
+create_win_change_rdp_port_script() {
+    target=$1
+    rdp_port=$2
+
+    info "Create win change rdp port script"
+
+    echo "set RdpPort=$rdp_port" >$target
+    wget $confhome/windows-change-rdp-port.bat -O- >>$target
+    unix2dos $target
+}
+
 # virt-what 要用最新版
 # vultr 1G High Frequency LAX 实际上是 kvm
 # debian 11 virt-what 1.19 显示为 hyperv qemu
@@ -3523,7 +3654,12 @@ install_windows() {
     mount -o ro /os/windows.iso /iso
 
     # 复制 boot.wim 到 /os，用于临时编辑
-    cp /iso/sources/boot.wim /os/boot.wim
+    if [ -n "$boot_wim" ]; then
+        # 自定义 boot.wim 链接
+        download "$boot_wim" /os/boot.wim
+    else
+        cp /iso/sources/boot.wim /os/boot.wim
+    fi
 
     # 从iso复制文件
     # 复制iso全部文件(除了boot.wim)到installer分区
@@ -3582,6 +3718,11 @@ install_windows() {
         done
     fi
     echo "Image Name: $image_name"
+
+    get_boot_wim_prop() {
+        property=$1
+        wiminfo "/os/boot.wim" | grep -i "^$property:" | cut -d: -f2- | xargs
+    }
 
     get_selected_image_prop() {
         property=$1
@@ -3652,6 +3793,15 @@ install_windows() {
         ;;
     esac
 
+    # 防止用了不兼容架构的 iso
+    if ! {
+        { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86_64 ]; } ||
+            { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86 ]; } ||
+            { [ "$(uname -m)" = "aarch64" ] && [ "$arch_wim" = arm64 ]; }
+    }; then
+        error_and_exit "The machine is $(uname -m), but the iso is $arch_wim."
+    fi
+
     add_drivers() {
         info "Add drivers"
 
@@ -3659,6 +3809,12 @@ install_windows() {
         mkdir -p "$drv"         # 驱动下载临时文件夹
         mkdir -p "/wim/drivers" # boot.wim 驱动文件夹
 
+        # 这里有坑
+        # $(get_cloud_vendor) 调用了 cache_dmi_and_virt
+        # 但是 $(get_cloud_vendor) 运行在 subshell 里面
+        # subshell 运行结束后里面的变量就消失了
+        # 因此先运行 cache_dmi_and_virt
+        cache_dmi_and_virt
         vendor="$(get_cloud_vendor)"
 
         # virtio
@@ -3682,6 +3838,14 @@ install_windows() {
             elif is_nt_ver_ge 6.0 && { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
                 add_driver_citrix_xen
             fi
+        fi
+
+        # vmd
+        # 改进: 像检测 virtio 那样直接从 /sys 检测设备
+        # inf 有要求 19041 或以上
+        if [ "$build_ver" -ge 19041 ] && [ "$arch_wim" = x86_64 ] &&
+            is_lspci_contains 'Volume Management Device'; then
+            add_driver_vmd
         fi
 
         # 厂商驱动
@@ -4030,10 +4194,25 @@ install_windows() {
         cp_drivers $drv/azure
     }
 
+    add_driver_vmd() {
+        apk add 7zip
+        download https://downloadmirror.intel.com/820815/SetupRST.exe $drv/SetupRST.exe
+        7z x $drv/SetupRST.exe -o$drv/SetupRST -i!.text
+        7z x $drv/SetupRST/.text -o$drv/vmd
+        cp_drivers $drv/vmd
+    }
+
     # 修改应答文件
     download $confhome/windows.xml /tmp/autounattend.xml
     locale=$(get_selected_image_prop 'Default Language')
-    sed -i "s|%arch%|$arch|; s|%image_name%|$image_name|; s|%locale%|$locale|; s|%password%|$PASSWORD|" \
+    use_default_rdp_port=$(is_need_change_rdp_port && echo false || echo true)
+    password_base64=$(get_password_windows_administrator_base64)
+    sed -i \
+        -e "s|%arch%|$arch|" \
+        -e "s|%image_name%|$image_name|" \
+        -e "s|%locale%|$locale|" \
+        -e "s|%administrator_password%|$password_base64|" \
+        -e "s|%use_default_rdp_port%|$use_default_rdp_port|" \
         /tmp/autounattend.xml
 
     # 修改应答文件，分区配置
@@ -4074,7 +4253,8 @@ install_windows() {
     # 挂载 boot.wim
     info "mount boot.wim"
     mkdir -p /wim
-    wimmountrw /os/boot.wim 2 /wim/
+    boot_index=$(get_boot_wim_prop 'Boot Index')
+    wimmountrw /os/boot.wim "$boot_index" /wim/
 
     cp_drivers() {
         src=$1
@@ -4102,10 +4282,11 @@ install_windows() {
     # 移除注释，否则 windows-setup.bat 重新生成的 autounattend.xml 有问题
     apk add xmlstarlet
     xmlstarlet ed -d '//comment()' /tmp/autounattend.xml >/wim/autounattend.xml
-    apk del xmlstarlet
     unix2dos /wim/autounattend.xml
     info "autounattend.xml"
-    cat -n /wim/autounattend.xml
+    # 查看最终文件，并屏蔽密码
+    xmlstarlet ed -d '//*[name()="AdministratorPassword" or name()="Password"]' /wim/autounattend.xml | cat -n
+    apk del xmlstarlet
 
     # 避免无参数运行 setup.exe 时自动安装
     mv /wim/autounattend.xml /wim/windows.xml
@@ -4168,8 +4349,12 @@ install_windows() {
 
     # 添加引导
     if is_efi; then
-        apk add efibootmgr
-        efibootmgr -c -L "Windows Installer" -d /dev/$xda -p1 -l "\\EFI\\boot\\$boot_efi"
+        # 现在 add_default_efi_to_nvram() 添加 bootx64.efi 到最前面
+        # 因此这里重复了
+        if false; then
+            apk add efibootmgr
+            efibootmgr -c -L "Windows Installer" -d /dev/$xda -p1 -l "\\EFI\\boot\\$boot_efi"
+        fi
     else
         # 或者用 ms-sys
         apk add grub-bios
@@ -4473,6 +4658,9 @@ if [ "$1" = "update" ]; then
     wget -O /trans.sh "$confhome/trans.sh"
     chmod +x /trans.sh
     exec /trans.sh
+elif [ "$1" = "alpine" ]; then
+    info 'switch to alpine'
+    distro=alpine
 fi
 
 # 无参数运行部分
@@ -4484,7 +4672,11 @@ mount / -o remount,size=100%
 hwclock -s || true
 
 # 设置密码，安装并打开 ssh
-echo "root:$PASSWORD" | chpasswd
+echo "root:$(get_password_linux_sha512)" | chpasswd -e
+apk add openssh
+if is_need_change_ssh_port; then
+    change_ssh_port / $ssh_port
+fi
 printf '\nyes' | setup-sshd
 
 # shellcheck disable=SC2154
