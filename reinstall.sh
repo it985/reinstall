@@ -18,8 +18,8 @@ export LC_ALL=C
 # 不要漏了最后的 $PATH，否则会找不到 windows 系统程序例如 diskpart
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
-# 记录日志
-exec > >(exec tee /reinstall.log) 2>&1
+# 记录日志，过滤含有 password 的行
+exec > >(tee >(grep -iv password >>/reinstall.log)) 2>&1
 THIS_SCRIPT=$(readlink -f "$0")
 trap 'trap_err $LINENO $?' ERR
 
@@ -33,37 +33,37 @@ trap_err() {
 
 usage_and_exit() {
     if is_in_windows; then
-        reinstall____=' reinstall.bat'
+        reinstall_____='.\reinstall.bat'
     else
-        reinstall____='./reinstall.sh'
+        reinstall_____=' ./reinstall.sh'
     fi
     cat <<EOF
-Usage: $reinstall____ centos      9
-                      anolis      7|8
-                      alma        8|9
-                      rocky       8|9
-                      redhat      8|9   --img='http://xxx.com/xxx.qcow2'
-                      opencloudos 8|9
-                      oracle      7|8|9
-                      fedora      39|40
-                      nixos       24.05
-                      debian      9|10|11|12
-                      openeuler   20.03|22.03|24.03
-                      alpine      3.17|3.18|3.19|3.20
-                      opensuse    15.5|15.6|tumbleweed
-                      ubuntu      16.04|18.04|20.04|22.04|24.04 [--minimal]
-                      kali
-                      arch
-                      gentoo
-                      dd          --img='http://xxx.com/xxx.raw'  (supports raw vhd gzip xz)
-                      windows     --image-name='windows xxx yyy'  --lang=xx-yy
-                      windows     --image-name='windows xxx yyy'  --iso='http://xxx.com/xxx.iso'
-                      netboot.xyz
+Usage: $reinstall_____ centos      9
+                       anolis      7|8
+                       alma        8|9
+                       rocky       8|9
+                       redhat      8|9 --img='http://xxx.com/xxx.qcow2'
+                       opencloudos 8|9
+                       oracle      7|8|9
+                       fedora      39|40
+                       nixos       24.05
+                       debian      9|10|11|12
+                       openeuler   20.03|22.03|24.03
+                       alpine      3.17|3.18|3.19|3.20
+                       opensuse    15.5|15.6|tumbleweed
+                       ubuntu      16.04|18.04|20.04|22.04|24.04 [--minimal]
+                       kali
+                       arch
+                       gentoo
+                       dd          --img='http://xxx.com/xxx.raw' (supports raw vhd gzip xz)
+                       windows     --image-name='windows xxx yyy' --lang=xx-yy
+                       windows     --image-name='windows xxx yyy' --iso='http://xxx.com/xxx.iso'
+                       netboot.xyz
 
-       Options:       [--ssh-port PORT]
-                      [--rdp-port PORT]
-                      [--web-port PORT]
-                      [--allow-ping]
+       Options:        [--ssh-port PORT]
+                       [--rdp-port PORT]
+                       [--web-port PORT]
+                       [--allow-ping]
 
 Manual: https://github.com/bin456789/reinstall
 
@@ -73,15 +73,16 @@ EOF
 
 info() {
     upper=$(to_upper <<<"$@")
-    echo_color_text '\e[32m' "***** $upper *****"
+    echo_color_text '\e[32m' "***** $upper *****" >&2
 }
 
 warn() {
-    echo_color_text '\e[33m' "Warning: $*"
+    echo_color_text '\e[33m' "Warning: $*" >&2
 }
 
 error() {
-    echo_color_text '\e[31m' "Error: $*"
+    echo_color_text '\e[31m' "***** ERROR *****" >&2
+    echo_color_text '\e[31m' "Error: $*" >&2
 }
 
 echo_color_text() {
@@ -854,7 +855,7 @@ setos() {
     }
 
     setos_debian() {
-        is_debian_eol() {
+        is_debian_elts() {
             [ "$releasever" -le 10 ]
         }
 
@@ -876,11 +877,14 @@ setos() {
 
         if is_use_cloud_image; then
             # cloud image
+            # debian --ci 用此标记要是否要换 elts 源
+            # shellcheck disable=SC2034
+            is_debian_elts && elts=1 || elts=0
             is_virt && ci_type=genericcloud || ci_type=generic
             eval ${step}_img=$cdimage_mirror/cloud/$codename/latest/debian-$releasever-$ci_type-$basearch_alt.qcow2
         else
             # 传统安装
-            if is_debian_eol; then
+            if is_debian_elts; then
                 # https://github.com/tuna/issues/issues/1999
                 # nju 也没同步
                 if false && is_in_china; then
@@ -1729,6 +1733,12 @@ check_ram() {
         fi
     fi
 
+    # 用于兜底，不太准确
+    if [ -z $ram_size ]; then
+        ram_size=$(free -m | grep ^Mem: | awk '{print $2}')
+        ram_size=$((ram_size + 64 + 4))
+    fi
+
     if [ -z $ram_size ] || [ $ram_size -le 0 ]; then
         error_and_exit "Could not detect RAM size."
     fi
@@ -1848,12 +1858,16 @@ save_password() {
     # alpine 这两个包有冲突
     # apk add expect mkpasswd
 
+    # 不要用 echo "$password" 保存密码，原因：
+    # password="-n"
+    # echo "$password"  # 空白
+
     # 明文密码
-    # 假如用户运行 alpine live 直接打包硬盘镜像，则会暴露明文密码，因为 netboot initrd 在里面
+    # 假如用户运行 alpine live 直接打包硬盘镜像，如果保存了明文密码，则会暴露明文密码，因为 netboot initrd 在里面
     # 通过 --password 传入密码，history 有记录，也会暴露明文密码
-    # /reinstall.log 也会暴露明文密码
+    # /reinstall.log 也会暴露明文密码（已处理）
     if false; then
-        echo "$password" >>"$dir/password-plaintext"
+        printf '%s' "$password" >>"$dir/password-plaintext"
     fi
 
     # sha512
@@ -1870,15 +1884,18 @@ save_password() {
     # alpine
     if is_have_cmd busybox && busybox mkpasswd --help 2>&1 | grep -wq sha512; then
         crypted=$(printf '%s' "$password" | busybox mkpasswd -m sha512)
-    # centos 7
-    elif is_have_cmd python2; then
-        crypted=$(python2 -c "import crypt; print(crypt.crypt('$password', crypt.mksalt(crypt.METHOD_SHA512)))")
     # others
     elif install_pkg openssl && openssl passwd --help 2>&1 | grep -wq '\-6'; then
         crypted=$(printf '%s' "$password" | openssl passwd -6 -stdin)
     # debian 9 / ubuntu 16
     elif is_have_cmd apt-get && install_pkg whois && mkpasswd -m help | grep -wq sha-512; then
         crypted=$(printf '%s' "$password" | mkpasswd -m sha-512 --stdin)
+    # centos 7
+    # crypt.mksalt 是 python3 的
+    # 红帽把它 backport 到了 centos7 的 python2 上
+    # 在其它发行版的 python2 上运行会出错
+    elif is_have_cmd yum && is_have_cmd python2; then
+        crypted=$(python2 -c "import crypt, sys; print(crypt.crypt(sys.argv[1], crypt.mksalt(crypt.METHOD_SHA512)))" "$password")
     else
         error_and_exit "Could not generate sha512 password."
     fi
@@ -2451,7 +2468,7 @@ build_extra_cmdline() {
     # 会将 extra.xxx=yyy 写入新系统的 /etc/modprobe.d/local.conf
     # https://answers.launchpad.net/ubuntu/+question/249456
     # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/lib/debian-installer-startup.d/S02module-params?ref_type=heads
-    for key in confhome hold force force_old_windows_setup cloud_image main_disk \
+    for key in confhome hold force force_old_windows_setup cloud_image main_disk elts \
         ssh_port rdp_port web_port allow_ping; do
         value=${!key}
         if [ -n "$value" ]; then
@@ -2503,8 +2520,8 @@ build_nextos_cmdline() {
         nextos_cmdline+=" mirror/http/hostname=$nextos_hostname"
         nextos_cmdline+=" mirror/http/directory=/$nextos_directory"
         nextos_cmdline+=" base-installer/kernel/image=$nextos_kernel"
-        # eol 的 debian 不能用 security 源，否则安装过程会提示无法访问
-        if [ "$nextos_distro" = debian ] && is_debian_eol; then
+        # elts 的 debian 不能用 security 源，否则安装过程会提示无法访问
+        if [ "$nextos_distro" = debian ] && is_debian_elts; then
             nextos_cmdline+=" apt-setup/services-select="
         fi
         # kali 安装好后网卡是 eth0 这种格式，但安装时不是
@@ -2736,7 +2753,7 @@ EOF
         chmod a+x cdrom/simple-cdd/kali.postinst
     fi
 
-    if [ "$distro" = debian ] && is_debian_eol; then
+    if [ "$distro" = debian ] && is_debian_elts; then
         curl -Lo usr/share/keyrings/debian-archive-keyring.gpg https://deb.freexian.com/extended-lts/archive-key.gpg
     fi
 
@@ -2810,7 +2827,7 @@ EOF
     # hack 3
     # 修改 trans.sh
     # 1. 直接调用 create_ifupdown_config
-    insert_into_file $initrd_dir/trans.sh after ': main' <<EOF
+    insert_into_file $initrd_dir/trans.sh after '^: main' <<EOF
         distro=$nextos_distro
         create_ifupdown_config /etc/network/interfaces
         exit
@@ -3316,12 +3333,12 @@ fi
 # 密码
 if ! is_netboot_xyz && [ -z "$password" ]; then
     if is_use_dd; then
-        warn "
+        echo "
 This password is only used for SSH access to view logs during the DD process.
 Password of the image will NOT modify.
 
 密码仅用于 DD 过程中通过 SSH 查看日志。
-镜像的密码将不会被修改。
+镜像的密码不会被修改。
 "
 
     fi

@@ -17,6 +17,7 @@ EFI_UUID=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 error() {
     color='\e[31m'
     plain='\e[0m'
+    echo -e "${color}***** ERROR *****${plain}" >&2
     echo -e "${color}Error: $*${plain}" >&2
 }
 
@@ -190,14 +191,14 @@ update_part() {
     # 如果 rm -rf 的时候刚好 mdev 在创建链接，rm -rf 会报错 Directory not empty
     # 因此要先停止 mdev 服务
     # 还要删除 /dev/$xda*?
-    rc-service mdev stop
+    ensure_service_stopped mdev
     rm -rf /dev/disk/*
 
     # 没挂载 modloop 时会提示
     # modprobe: can't change directory to '/lib/modules': No such file or directory
     # 因此强制不显示上面的提示
     mdev -sf 2>/dev/null
-    rc-service mdev start 2>/dev/null
+    ensure_service_started mdev 2>/dev/null
     sleep 1
 }
 
@@ -228,12 +229,27 @@ setup_nginx() {
     fi
     sed -i "s/@WEB_PORT@/$web_port/gi" /etc/nginx/http.d/default.conf
 
-    # rc-service nginx start
+    # rc-service -q nginx start
     if pgrep nginx >/dev/null; then
         nginx -s reload
     else
         nginx
     fi
+}
+
+setup_websocketd() {
+    apk add websocketd
+    wget $confhome/logviewer.html -O /tmp/index.html
+    apk add coreutils
+
+    if [ -z "$web_port" ]; then
+        web_port=80
+    fi
+
+    pkill websocketd || true
+    # websocketd 遇到 \n 才推送，因此要转换 \r 为 \n
+    websocketd --port "$web_port" --loglevel=fatal --staticdir=/tmp \
+        stdbuf -oL -eL sh -c "tail -fn+0 /reinstall.log | tr '\r' '\n'" &
 }
 
 get_approximate_ram_size() {
@@ -255,15 +271,15 @@ setup_web_if_enough_ram() {
     if [ $total_ram -gt 400 ]; then
         # lighttpd 虽然运行占用内存少，但安装占用空间大
         # setup_lighttpd
-        setup_nginx
-        # setup_websocketd
+        # setup_nginx
+        setup_websocketd
     fi
 }
 
 setup_lighttpd() {
     apk add lighttpd
     ln -sf /reinstall.html /var/www/localhost/htdocs/index.html
-    rc-service lighttpd start
+    rc-service -q lighttpd start
 }
 
 get_ttys() {
@@ -273,6 +289,14 @@ get_ttys() {
 }
 
 find_xda() {
+    # 出错后再运行脚本，硬盘可能已经格式化，之前记录的分区表 id 无效
+    # 因此找到 xda 后要保存 xda 到 /config/xda
+
+    # 先读取之前保存的
+    if xda=$(get_config xda 2>/dev/null) && [ -n "$xda" ]; then
+        return
+    fi
+
     # 防止 $main_disk 为空
     if [ -z "$main_disk" ]; then
         error_and_exit "cmdline main_disk is empty."
@@ -305,7 +329,9 @@ find_xda() {
         xda=$(lsblk --nodeps -rno NAME,PTUUID | grep -iw "$main_disk" | awk '{print $1}')
     fi
 
-    if [ -z "$xda" ]; then
+    if [ -n "$xda" ]; then
+        set_config xda "$xda"
+    else
         error_and_exit "Could not find xda: $main_disk"
     fi
 
@@ -332,10 +358,22 @@ extract_env_from_cmdline() {
     done
 }
 
-ensure_modloop_started() {
-    if ! rc-service modloop status; then
-        if ! retry 5 rc-service modloop start; then
-            error_and_exit "modloop failed to start."
+ensure_service_started() {
+    service=$1
+
+    if ! rc-service -q $service status; then
+        if ! retry 5 rc-service -q $service start; then
+            error_and_exit "Failed to start $service."
+        fi
+    fi
+}
+
+ensure_service_stopped() {
+    service=$1
+
+    if rc-service -q $service status; then
+        if ! retry 5 rc-service -q $service stop; then
+            error_and_exit "Failed to stop $service."
         fi
     fi
 }
@@ -378,7 +416,9 @@ clear_previous() {
         dmsetup remove_all
     fi
     disconnect_qcow
-    rc-service --ifexists --ifstarted nix-daemon stop
+    # 安装 arch 有 gpg-agent 进程驻留
+    pkill gpg-agent || true
+    rc-service -q --ifexists --ifstarted nix-daemon stop
     swapoff -a
     umount_all
 
@@ -399,13 +439,13 @@ cache_dmi_and_virt() {
         _virt=$(
             virt-what
 
-            # hyper-v 环境下 modprobe virtio_scsi 也会创建 /sys/bus/virtio/drivers
-            # 因此用 devices 判断更准确，有设备时才有 devices
+            # hyper-v 环境下 modprobe virtio_scsi 也会创建 /sys/bus/virtio/drivers/virtio_scsi
+            # 因此用 devices 判断更准确，有设备时才有 /sys/bus/virtio/drivers/*
             # 或者加上 lspci 检测?
 
-            # 不要用 [ -d /sys/bus/virtio/devices ] && echo virtio
-            # 因为非 virtio 时返回值不为 0
-            if [ -d /sys/bus/virtio/devices ]; then
+            # 不要用 ls /sys/bus/virtio/devices/* && echo virtio
+            # 因为有可能返回值不为 0 而中断脚本
+            if ls /sys/bus/virtio/devices/* >/dev/null 2>&1; then
                 echo virtio
             fi
         )
@@ -453,6 +493,10 @@ is_lspci_contains() {
 
 get_config() {
     cat "/configs/$1"
+}
+
+set_config() {
+    printf '%s' "$2" >"/configs/$1"
 }
 
 get_password_linux_sha512() {
@@ -627,6 +671,10 @@ is_windows_support_rdnss() {
     error_and_exit "Not found kernel32.dll"
 }
 
+is_elts() {
+    [ -n "$elts" ] && [ "$elts" = 1 ]
+}
+
 is_need_change_ssh_port() {
     [ -n "$ssh_port" ] && ! [ "$ssh_port" = 22 ]
 }
@@ -669,7 +717,6 @@ to_lower() {
 }
 
 del_empty_lines() {
-    # grep .
     sed '/^[[:space:]]*$/d'
 }
 
@@ -1088,7 +1135,7 @@ install_alpine() {
 
     if $hack_lowram_modloop; then
         # 预先加载需要的模块
-        if rc-service modloop status; then
+        if rc-service -q modloop status; then
             modules="ext4 vfat nls_utf8 nls_cp437"
             for mod in $modules; do
                 modprobe $mod
@@ -1099,7 +1146,7 @@ install_alpine() {
         fi
 
         # 删除 modloop ，释放内存
-        rc-service modloop stop
+        ensure_service_stopped modloop
         rm -f /lib/modloop-lts /lib/modloop-virt
     fi
 
@@ -1195,6 +1242,12 @@ install_alpine() {
     chroot /os setup-timezone -i Asia/Shanghai
     chroot /os setup-ntp chrony || true
 
+    # 安装固件微码
+    # shellcheck disable=SC2046
+    if is_need_ucode_firmware; then
+        chroot /os apk add $(get_ucode_firmware_pkgs)
+    fi
+
     # 3.19 或以上，非 efi 需要手动安装 grub
     if ! is_efi; then
         grub-install --boot-directory=/os/boot --target=i386-pc /dev/$xda
@@ -1225,7 +1278,7 @@ install_alpine() {
 }
 
 get_cpu_vendor() {
-    cpu_vendor=$(grep 'vendor_id' /proc/cpuinfo | head -n 1 | cut -d: -f2 | xargs)
+    cpu_vendor=$(grep 'vendor_id' /proc/cpuinfo | head -1 | awk '{print $NF}')
     case "$cpu_vendor" in
     GenuineIntel) echo intel ;;
     AuthenticAMD) echo amd ;;
@@ -1316,7 +1369,7 @@ install_nixos() {
         if is_in_china; then
             echo "substituters = $mirror/store" >>/etc/nix/nix.conf
         fi
-        rc-service nix-daemon restart
+        rc-service -q nix-daemon restart
         # 添加 nix-env 安装的软件到 PATH
         PATH="/root/.nix-profile/bin:$PATH"
         ;;
@@ -1488,6 +1541,13 @@ install_arch_gentoo() {
 
         apk add arch-install-scripts
 
+        # 为了二次运行时 /etc/pacman.conf 未修改
+        if [ -f /etc/pacman.conf.orig ]; then
+            cp /etc/pacman.conf.orig /etc/pacman.conf
+        else
+            cp /etc/pacman.conf /etc/pacman.conf.orig
+        fi
+
         # 设置 repo
         insert_into_file /etc/pacman.conf before '\[core\]' <<EOF
 SigLevel = Never
@@ -1537,15 +1597,9 @@ EOF
         fi
 
         # firmware + microcode
-        if ! is_virt; then
-            chroot $os_dir pacman -Syu --noconfirm linux-firmware
-
-            if [ "$(uname -m)" = x86_64 ]; then
-                cpu_vendor="$(get_cpu_vendor)"
-                case "$cpu_vendor" in
-                intel | amd) chroot $os_dir pacman -Syu --noconfirm "$cpu_vendor-ucode" ;;
-                esac
-            fi
+        if is_need_ucode_firmware; then
+            # shellcheck disable=SC2046
+            chroot $os_dir pacman -Syu --noconfirm $(get_ucode_firmware_pkgs)
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
@@ -1661,13 +1715,9 @@ EOF
         fi
 
         # firmware + microcode
-        if ! is_virt; then
-            chroot $os_dir emerge sys-kernel/linux-firmware
-
-            # amd microcode 包括在 linux-firmware 里面
-            if [ "$(uname -m)" = x86_64 ] && [ "$(get_cpu_vendor)" = intel ]; then
-                chroot $os_dir emerge sys-firmware/intel-microcode
-            fi
+        if is_need_ucode_firmware; then
+            # shellcheck disable=SC2046
+            chroot $os_dir emerge $(get_ucode_firmware_pkgs)
         fi
 
         # 安装 grub + 内核
@@ -1687,8 +1737,12 @@ EOF
     install_$distro
 
     # 初始化
-    chroot $os_dir systemctl preset-all
-    chroot $os_dir systemd-firstboot --force --setup-machine-id
+    if false; then
+        # preset-all 后多了很多服务，内存占用多了几十M
+        chroot $os_dir systemctl preset-all
+    fi
+    # 此时不能用
+    # chroot $os_dir timedatectl set-timezone Asia/Shanghai
     chroot $os_dir systemd-firstboot --force --timezone=Asia/Shanghai
     chroot $os_dir systemctl enable systemd-networkd
     chroot $os_dir systemctl enable systemd-resolved
@@ -1703,8 +1757,8 @@ EOF
 
     # 网络配置
     apk add cloud-init
-    useradd systemd-network
-    touch net.cfg
+    # 第二次运行会报错
+    useradd systemd-network || true
     create_cloud_init_network_config net.cfg
     # 正常应该是 -D gentoo，但 alpine 的 cloud-init 包缺少 gentoo 配置
     cloud-init devel net-convert -p net.cfg -k yaml -d out -D alpine -O networkd
@@ -1793,38 +1847,37 @@ dd_gzip_xz_raw() {
         # vhd 文件结尾有 512 字节额外信息，可以忽略
         if grep -iq 'No space' /tmp/dd_stderr; then
             apk add parted
-            disk_size=$(get_xda_size)
+            disk_size=$(get_disk_size /dev/$xda)
             disk_end=$((disk_size - 1))
-            # 这里要 Ignore 两次
-            # Error: Can't have a partition outside the disk!
-            # Ignore/Cancel? i
-            # Error: Can't have a partition outside the disk!
-            # Ignore/Cancel? i
-            last_part_end=$(yes i | parted /dev/$xda 'unit b print' ---pretend-input-tty |
-                del_empty_lines | tail -1 | awk '{print $3}' | sed 's/B//')
 
-            echo "Last part end: $last_part_end"
-            echo "Disk end:      $disk_end"
+            # 如果报错，那大概是因为镜像比硬盘大
+            if last_part_end=$(parted -sf /dev/$xda 'unit b print' ---pretend-input-tty |
+                del_empty_lines | tail -1 | awk '{print $3}' | sed 's/B//' | grep .); then
 
-            if [ "$last_part_end" -le "$disk_end" ]; then
-                echo "Safely ignore no space error."
-                return
+                echo "Last part end: $last_part_end"
+                echo "Disk end:      $disk_end"
+
+                if [ "$last_part_end" -le "$disk_end" ]; then
+                    echo "Safely ignore no space error."
+                    return
+                fi
             fi
         fi
         error_and_exit "$(cat /tmp/dd_stderr)"
     fi
 }
 
-get_xda_size() {
-    blockdev --getsize64 /dev/$xda
+get_dick_sector_count() {
+    # cat /proc/partitions
+    blockdev --getsz "$1"
 }
 
-get_nbd_size() {
-    blockdev --getsize64 /dev/nbd0
+get_disk_size() {
+    blockdev --getsize64 "$1"
 }
 
 is_xda_gt_2t() {
-    disk_size=$(get_xda_size)
+    disk_size=$(get_disk_size /dev/$xda)
     disk_2t=$((2 * 1024 * 1024 * 1024 * 1024))
     [ "$disk_size" -gt "$disk_2t" ]
 }
@@ -2066,7 +2119,12 @@ get_yq_name() {
 
 create_cloud_init_network_config() {
     ci_file=$1
+
     info "Create Cloud Init network config"
+
+    # 防止文件未创建
+    mkdir -p "$(dirname "$ci_file")"
+    touch "$ci_file"
 
     apk add "$(get_yq_name)"
 
@@ -2183,10 +2241,17 @@ create_cloud_init_network_config() {
     apk del "$(get_yq_name)"
 }
 
-truncate_machine_id() {
+# 实测没用，生成的 machine-id 是固定的
+clear_machine_id() {
     os_dir=$1
 
-    truncate -s 0 $os_dir/etc/machine-id
+    # https://www.freedesktop.org/software/systemd/man/latest/machine-id.html
+    if [ -f $os_dir/etc/machine-id ]; then
+        echo uninitialized >$os_dir/etc/machine-id
+    fi
+
+    # https://build.opensuse.org/projects/Virtualization:Appliances:Images:openSUSE-Leap-15.5/packages/kiwi-templates-Minimal/files/config.sh?expand=1
+    rm -f $os_dir/var/lib/systemd/random-seed
 }
 
 download_cloud_init_config() {
@@ -2386,6 +2451,56 @@ restore_resolv_conf() {
     fi
 }
 
+is_need_ucode_firmware() {
+    ! is_virt && [ -n "$(get_ucode_firmware_pkgs)" ]
+}
+
+get_ucode_firmware_pkgs() {
+    case "$distro" in
+    centos | alma | rocky | oracle | redhat | anolis | opencloudos | openeuler) os=elol ;;
+    *) os=$distro ;;
+    esac
+
+    case "$os-$(get_cpu_vendor)" in
+    alpine-intel) echo linux-firmware linux-firmware-intel intel-ucode ;;
+    alpine-amd) echo linux-firmware linux-firmware-amd linux-firmware-amd-ucode amd-ucode ;;
+    alpine-*) echo linux-firmware ;;
+
+    debian-intel) echo firmware-linux intel-microcode ;;
+    debian-amd) echo firmware-linux amd64-microcode ;;
+    debian-*) echo firmware-linux ;;
+
+    ubuntu-intel) echo linux-firmware intel-microcode ;;
+    ubuntu-amd) echo linux-firmware amd64-microcode ;;
+    ubuntu-*) echo linux-firmware ;;
+
+    # 无法同时安装 kernel-firmware kernel-firmware-intel
+    opensuse-intel) echo kernel-firmware ucode-intel ;;
+    opensuse-amd) echo kernel-firmware ucode-amd ;;
+    opensuse-*) echo kernel-firmware ;;
+
+    arch-intel) echo linux-firmware intel-ucode ;;
+    arch-amd) echo linux-firmware amd-ucode ;;
+    arch-*) echo linux-firmware ;;
+
+    gentoo-intel) echo linux-firmware intel-microcode ;;
+    gentoo-amd) echo linux-firmware ;;
+    gentoo-*) echo linux-firmware ;;
+
+    nixos-intel) echo linux-firmware microcodeIntel ;;
+    nixos-amd) echo linux-firmware microcodeAmd ;;
+    nixos-*) echo linux-firmware ;;
+
+    fedora-intel) echo linux-firmware microcode_ctl ;;
+    fedora-amd) echo linux-firmware amd-ucode-firmware microcode_ctl ;;
+    fedora-*) echo linux-firmware microcode_ctl ;;
+
+    elol-intel) echo linux-firmware microcode_ctl ;;
+    elol-amd) echo linux-firmware microcode_ctl ;;
+    elol-*) echo linux-firmware microcode_ctl ;;
+    esac
+}
+
 modify_linux() {
     os_dir=$1
     info "Modify Linux"
@@ -2411,52 +2526,122 @@ EOF
 
     download_cloud_init_config $os_dir
 
-    truncate_machine_id $os_dir
+    clear_machine_id $os_dir
 
-    # 为红帽系禁用 selinux kdump
+    # el/ol/fedora/国产fork
+    # 1. 禁用 selinux kdump
+    # 2. 添加微码+固件
     if [ -f $os_dir/etc/redhat-release ]; then
         find_and_mount /boot
         find_and_mount /boot/efi
+        mount_pseudo_fs $os_dir
+        cp_resolv_conf $os_dir
+
         disable_selinux_kdump $os_dir
+        if is_need_ucode_firmware; then
+            is_have_cmd_on_disk $os_dir dnf && mgr=dnf || mgr=yum
+            # shellcheck disable=SC2046
+            chroot $os_dir $mgr install -y $(get_ucode_firmware_pkgs)
+        fi
+
+        restore_resolv_conf $os_dir
     fi
 
-    # debian 网络问题
+    # debian
+    # 1. EOL 换源
+    # 2. 修复网络问题
+    # 3. 添加微码+固件
     # 注意 ubuntu 也有 /etc/debian_version
     if [ "$distro" = debian ]; then
         # 修复 onlink 网关
         add_onlink_script_if_need
 
         mount_pseudo_fs $os_dir
+        cp_resolv_conf $os_dir
+        find_and_mount /boot
+        find_and_mount /boot/efi
+
+        # 获取当前开启的 Components, 后面要用
+        if [ -f $os_dir/etc/apt/sources.list.d/debian.sources ]; then
+            comps=$(grep ^Components: $os_dir/etc/apt/sources.list.d/debian.sources | head -1 | cut -d' ' -f2-)
+        else
+            comps=$(grep '^deb ' $os_dir/etc/apt/sources.list | head -1 | cut -d' ' -f4-)
+        fi
+
+        # EOL 处理
+        if is_elts; then
+            wget https://deb.freexian.com/extended-lts/archive-key.gpg \
+                -O $os_dir/etc/apt/trusted.gpg.d/freexian-archive-extended-lts.gpg
+
+            is_in_china &&
+                mirror=http://mirror.nju.edu.cn/debian-elts ||
+                mirror=http://deb.freexian.com/extended-lts
+
+            codename=$(grep '^VERSION_CODENAME=' $os_dir/etc/os-release | cut -d= -f2)
+
+            if [ -f $os_dir/etc/apt/sources.list.d/debian.sources ]; then
+                cat <<EOF >$os_dir/etc/apt/sources.list.d/debian.sources
+Types: deb
+URIs: $mirror
+Suites: $codename
+Components: $comps
+Signed-By: /etc/apt/trusted.gpg.d/freexian-archive-extended-lts.gpg
+EOF
+            else
+                echo "deb $mirror $codename $comps" >$os_dir/etc/apt/sources.list
+            fi
+        fi
 
         # 检测机器是否能用 cloud 内核
-        axx64=$(get_axx64)
-        eths=$(get_eths)
-        if ls $os_dir/boot/vmlinuz-*-cloud-$axx64 2>/dev/null &&
-            ! sh /can_use_cloud_kernel.sh "$xda" $eths; then
+        # shellcheck disable=SC2046
+        if ls $os_dir/boot/vmlinuz-*-cloud-$(get_axx64) 2>/dev/null &&
+            ! sh /can_use_cloud_kernel.sh "$xda" $(get_eths); then
 
-            cp_resolv_conf $os_dir
-            chroot $os_dir apt-get update
-            DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y linux-image-$axx64
+            chroot_apt_install $os_dir "linux-image-$(get_axx64)"
 
             # 标记云内核包
             # apt-mark showmanual 结果为空，返回值也是 0
-            if pkgs=$(chroot $os_dir apt-mark showmanual linux-*-cloud-$axx64 | grep .); then
+            if pkgs=$(chroot $os_dir apt-mark showmanual "linux-*-cloud-$(get_axx64)" | grep .); then
                 chroot $os_dir apt-mark auto $pkgs
 
                 # 使用 autoremove
                 chroot_apt_autoremove $os_dir
             fi
-            restore_resolv_conf $os_dir
+        fi
+
+        # 微码+固件
+        if is_need_ucode_firmware; then
+            #  debian 10 11 的 iucode-tool 在 contrib 里面
+            #  debian 12 的 iucode-tool 在 main 里面
+            [ "$releasever" -ge 12 ] &&
+                comps_to_add=non-free-firmware ||
+                comps_to_add="contrib non-free"
+
+            if [ -f $os_dir/etc/apt/sources.list.d/debian.sources ]; then
+                file=$os_dir/etc/apt/sources.list.d/debian.sources
+                search='^[# ]*Components:'
+            else
+                file=$os_dir/etc/apt/sources.list
+                search='^[# ]*deb'
+            fi
+
+            for c in $comps_to_add; do
+                if ! echo "$comps" | grep -wq "$c"; then
+                    sed -Ei "/$search/s/$/ $c/" $file
+                fi
+            done
+
+            # shellcheck disable=SC2046
+            chroot_apt_install $os_dir $(get_ucode_firmware_pkgs)
         fi
 
         if [ "$releasever" -le 11 ]; then
-            cp_resolv_conf $os_dir
             chroot $os_dir apt-get update
 
             if true; then
                 # 将 debian 11 设置为 12 一样的网络管理器
                 # 可解决 ifupdown dhcp 不支持 24位掩码+不规则网关的问题
-                DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y netplan.io
+                chroot_apt_install $os_dir netplan.io
                 chroot $os_dir systemctl disable networking resolvconf
                 chroot $os_dir systemctl enable systemd-networkd systemd-resolved
                 rm_resolv_conf $os_dir
@@ -2470,23 +2655,65 @@ EOF
 
             else
                 # debian 11 默认不支持 rdnss，要安装 rdnssd 或者 nm
-                DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y rdnssd
-                # 不会自动建立链接，因此不能删除
-                restore_resolv_conf $os_dir
+                chroot_apt_install $os_dir rdnssd
             fi
         fi
+
+        # 不会自动建立链接，因此不能删除
+        restore_resolv_conf $os_dir
     fi
 
-    # opensuse leap
-    if grep opensuse-leap $os_dir/etc/os-release; then
-        # 修复 onlink 网关
-        add_onlink_script_if_need
-    fi
+    # opensuse
+    # 1. kernel-default-base 缺少 nvme 驱动，换成 kernel-default
+    # 2. 添加微码+固件
+    # https://documentation.suse.com/smart/virtualization-cloud/html/minimal-vm/index.html
+    if grep -q opensuse $os_dir/etc/os-release; then
+        create_swap_if_ram_less_than 1024 $os_dir/swapfile
+        mount_pseudo_fs $os_dir
+        cp_resolv_conf $os_dir
+        find_and_mount /boot
+        find_and_mount /boot/efi
 
-    # opensuse tumbleweed
-    # TODO: cloud-init 更新后删除
-    if grep opensuse-tumbleweed $os_dir/etc/os-release; then
-        touch $os_dir/etc/NetworkManager/NetworkManager.conf
+        # opensuse leap
+        if grep opensuse-leap $os_dir/etc/os-release; then
+            # 修复 onlink 网关
+            add_onlink_script_if_need
+        fi
+
+        # opensuse tumbleweed
+        # 更新到 cloud-init 24.1 后删除
+        if grep opensuse-tumbleweed $os_dir/etc/os-release; then
+            touch $os_dir/etc/NetworkManager/NetworkManager.conf
+        fi
+
+        # 不能同时装 kernel-default-base 和 kernel-default
+        chroot $os_dir zypper remove -y kernel-default-base
+
+        # 固件+微码
+        if is_need_ucode_firmware; then
+            # shellcheck disable=SC2046
+            chroot $os_dir zypper install -y $(get_ucode_firmware_pkgs)
+        fi
+
+        # 选择新内核
+        # 只有 leap 有 kernel-azure
+        if grep -q opensuse-leap $os_dir/etc/os-release && [ "$(get_cloud_vendor)" = azure ]; then
+            kernel='kernel-azure'
+        else
+            kernel='kernel-default'
+        fi
+
+        # 必须设置一个密码，否则报错
+        # Failed to get root password hash
+        # Failed to import /etc/uefi/certs/76B6A6A0.crt
+        # warning: %post(kernel-default-5.14.21-150500.55.83.1.x86_64) scriptlet failed, exit status 255
+        echo "root:$(mkpasswd '')" | chroot $os_dir chpasswd -e
+        chroot $os_dir zypper install -y $kernel
+        chroot $os_dir passwd -d root
+
+        restore_resolv_conf $os_dir
+        swapoff $os_dir/swapfile
+        rm -f $os_dir/swapfile
     fi
 
     # arch
@@ -2850,6 +3077,19 @@ chroot_dnf() {
     fi
 }
 
+chroot_apt_install() {
+    os_dir=$1
+    shift
+
+    current_hash=$(cat $os_dir/etc/apt/sources.list $os_dir/etc/apt/sources.list.d/*.sources 2>/dev/null | md5sum)
+    if ! [ "$saved_hash" = "$current_hash" ]; then
+        chroot $os_dir apt-get update
+        saved_hash="$current_hash"
+    fi
+
+    DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y "$@"
+}
+
 chroot_apt_autoremove() {
     os_dir=$1
 
@@ -3041,8 +3281,8 @@ install_qcow_by_copy() {
         # selinux kdump
         disable_selinux_kdump /os
 
-        # 部分镜像例如 centos7 要手动删除 machine-id
-        truncate_machine_id /os
+        # centos7 删除 machine-id 后不会自动重建
+        clear_machine_id /os
 
         # el7 yum 可能会使用 ipv6，即使没有 ipv6 网络
         if [ "$releasever" = 7 ]; then
@@ -3062,6 +3302,12 @@ install_qcow_by_copy() {
             sed -Ei -e 's,(mirrorlist=),#\1,' \
                 -e "s,#(baseurl=http://)mirror.centos.org,\1$mirror," /os/etc/yum.repos.d/CentOS-Base.repo
             chroot_dnf install NetworkManager
+        fi
+
+        # firmware + microcode
+        if is_need_ucode_firmware; then
+            # shellcheck disable=SC2046
+            chroot_dnf install $(get_ucode_firmware_pkgs)
         fi
 
         # anolis 7 镜像自带 nm
@@ -3223,11 +3469,13 @@ configfile \$prefix/grub.cfg
 EOF
         fi
 
+        # 更新包索引
+        chroot $os_dir apt-get update
+
         # 安装最佳内核
         flavor=$(get_ubuntu_kernel_flavor)
         echo "Use kernel flavor: $flavor"
-        chroot $os_dir apt-get update
-        DEBIAN_FRONTEND=noninteractive chroot $os_dir apt-get install -y "linux-image-$flavor"
+        chroot_apt_install $os_dir "linux-image-$flavor"
 
         # 自带内核：
         # 常规版本             generic
@@ -3245,10 +3493,16 @@ EOF
             chroot_apt_autoremove $os_dir
         fi
 
+        # 安装固件+微码
+        if is_need_ucode_firmware; then
+            # shellcheck disable=SC2046
+            chroot_apt_install $os_dir $(get_ucode_firmware_pkgs)
+        fi
+
         # 16.04 镜像用 ifupdown/networking 管理网络
         # 要安装 resolveconf，不然 /etc/resolv.conf 为空
         if [ "$releasever" = 16.04 ]; then
-            chroot $os_dir apt-get install -y resolvconf
+            chroot_apt_install $os_dir resolvconf
             ln -sf /run/resolvconf/resolv.conf $os_dir/etc/resolv.conf.orig
         fi
 
@@ -3329,11 +3583,19 @@ EOF
     parted /dev/$xda -s rm 3
 }
 
+get_partition_table_format() {
+    apk add parted
+    parted "$1" -s print | grep 'Partition Table:' | awk '{print $NF}'
+}
+
 dd_qcow() {
     info "DD qcow2"
 
     if true; then
         connect_qcow
+
+        partition_table_format=$(get_partition_table_format /dev/nbd0)
+        orig_nbd_virtual_size=$(get_disk_size /dev/nbd0)
 
         # 检查最后一个分区是否是 btrfs
         # 即使awk结果为空，返回值也是0，加上 grep . 检查是否结果为空
@@ -3412,34 +3674,138 @@ dd_qcow() {
     # 将前1M从内存 dd 到硬盘
     umount /installer/
     dd if=/first-1M of=/dev/$xda
-    update_part
 
+    # gpt 分区表开头记录了备份分区表的位置
+    # 如果 qcow2 虚拟容量 大于 实际硬盘容量
+    # 备份分区表的位置 将超出实际硬盘容量的大小
+    # partprobe 会报错
+    # Error: Invalid argument during seek for read on /dev/vda
+    # parted 也无法正常工作
+    # 需要提前修复分区表
+
+    # 目前只有这个例子，因为其他 qcow2 虚拟容量最多 5g，是设定支持的容量
+    # openSUSE-Leap-15.5-Minimal-VM.x86_64-kvm-and-xen.qcow2 容量是 25g
+    # 缩小 btrfs 分区后 dd 到 10g 的机器上
+    # 备份分区表的位置是 25g
+    # 需要修复到 10g 的位置上
+    # 否则 partprobe parted 都无法正常工作
+
+    # 仅这种情况才用 sgdisk 修复
+    if [ "$partition_table_format" = gpt ] &&
+        [ "$orig_nbd_virtual_size" -gt "$(get_disk_size /dev/$xda)" ]; then
+        fix_gpt_backup_partition_table_by_sgdisk
+    fi
+    update_part
 }
 
-fix_partition_table_by_parted() {
+fix_gpt_backup_partition_table_by_sgdisk() {
+    # 当备份分区表超出实际硬盘容量时，只能用 sgdisk 修复分区表
+    # 应用场景：镜像大小超出硬盘实际硬盘，但缩小分区后不超出实际硬盘容量，可以顺利 DD
+    # 例子 openSUSE-Leap-15.5-Minimal-VM.x86_64-kvm-and-xen.qcow2
+
+    # parted 无法修复
+    # parted /dev/$xda -f -s print
+
+    # fdisk/sfdisk 显示主分区表损坏
+    # echo write | sfdisk /dev/$xda
+    # GPT PMBR size mismatch (50331647 != 20971519) will be corrected by write.
+    # The primary GPT table is corrupt, but the backup appears OK, so that will be used.
+
+    # 除此之外的场景应该用 parted 来修复
+
+    apk add sgdisk
+
+    # 两种方法都可以，但都不会修复备份分区表的 GUID
+    # 此时 sgdisk -v /dev/vda 会提示主副分区表 guid 不相同
+    # localhost:~# sgdisk -v /dev/$xda
+    # Problem: main header's disk GUID (A24485F3-2C02-43BD-BF4E-F52E42B00DEA) doesn't
+    # match the backup GPT header's disk GUID (ADAF57BC-B4F5-4E04-BCBA-BDDCD796C388)
+    # You should use the 'b' or 'd' option on the recovery & transformation menu to
+    # select one or the other header.
+    if false; then
+        sgdisk --backup /gpt-partition-table /dev/$xda
+        sgdisk --load-backup /gpt-partition-table /dev/$xda
+    else
+        sgdisk --move-second-header /dev/$xda
+    fi
+
+    # 因此需要运行一次设置 guid
+    if new_guid=$(sgdisk -v /dev/$xda | grep GUID | head -1 | grep -Eo '[0-9A-F-]{36}'); then
+        sgdisk --disk-guid $new_guid /dev/$xda
+    fi
+
+    update_part
+
+    apk del sgdisk
+}
+
+# 适用于 DD 后修复 gpt 备份分区表
+fix_gpt_backup_partition_table_by_parted() {
     parted /dev/$xda -f -s print
+    update_part
 }
 
 resize_after_install_cloud_image() {
     # 提前扩容
     # 1 修复 vultr 512m debian 11 generic/genericcloud 首次启动 kernel panic
-    # 2 修复 gentoo websync 时空间不足
-    if [ "$distro" = debian ] || [ "$distro" = gentoo ]; then
-        info "Resize after install cloud image"
+    # 2 防止 gentoo 云镜像 websync 时空间不足
+    info "Resize after dd"
+    lsblk -f /dev/$xda
 
-        apk add parted
-        if fix_partition_table_by_parted 2>&1 | grep -q 'Fixing'; then
-            system_part_num=$(parted /dev/$xda -m print | tail -1 | cut -d: -f1)
-            printf "yes" | parted /dev/$xda resizepart $system_part_num 100% ---pretend-input-tty
-            update_part
+    # 打印分区表，并自动修复备份分区表
+    fix_gpt_backup_partition_table_by_parted
 
-            if [ "$distro" = gentoo ]; then
-                apk add e2fsprogs-extra
-                e2fsck -p -f /dev/$xda*$system_part_num
-                resize2fs /dev/$xda*$system_part_num
-            fi
-            update_part
-        fi
+    disk_size=$(get_disk_size /dev/$xda)
+    disk_end=$((disk_size - 1))
+
+    # 不能漏掉最后的 _ ，否则第6部分都划到给 last_part_fs
+    IFS=: read -r last_part_num _ last_part_end _ last_part_fs _ \
+        < <(parted -msf /dev/$xda 'unit b print' | tail -1)
+    last_part_end=$(echo $last_part_end | sed 's/B//')
+
+    # 大于 100M 才扩容
+    if [ $((disk_end - last_part_end)) -ge $((100 * 1024 * 1024)) ]; then
+        printf "yes" | parted /dev/$xda resizepart $last_part_num 100% ---pretend-input-tty
+        update_part
+
+        mkdir -p /os
+
+        # lvm ?
+        # 用 cloud-utils-growpart？
+        case "$last_part_fs" in
+        ext4)
+            # debian ci
+            apk add e2fsprogs-extra
+            e2fsck -p -f /dev/$xda*$last_part_num
+            resize2fs /dev/$xda*$last_part_num
+            apk del e2fsprogs-extra
+            ;;
+        xfs)
+            # opensuse ci
+            apk add xfsprogs-extra
+            mount /dev/$xda*$last_part_num /os
+            xfs_growfs /dev/$xda*$last_part_num
+            umount /os
+            apk del xfsprogs-extra
+            ;;
+        btrfs)
+            # fedora ci
+            apk add btrfs-progs
+            mount /dev/$xda*$last_part_num /os
+            btrfs filesystem resize max /os
+            umount /os
+            apk del btrfs-progs
+            ;;
+        ntfs)
+            # windows dd
+            apk add ntfs-3g-progs
+            echo y | ntfsresize /dev/$xda*$last_part_num
+            ntfsfix -d /dev/$xda*$last_part_num
+            apk del ntfs-3g-progs
+            ;;
+        esac
+        update_part
+        parted /dev/$xda -s print
     fi
 }
 
@@ -4412,6 +4778,12 @@ get_ubuntu_kernel_flavor() {
             echo generic-hwe-$releasever
         fi
     else
+        # 这里有坑
+        # $(get_cloud_vendor) 调用了 cache_dmi_and_virt
+        # 但是 $(get_cloud_vendor) 运行在 subshell 里面
+        # subshell 运行结束后里面的变量就消失了
+        # 因此先运行 cache_dmi_and_virt
+        cache_dmi_and_virt
         vendor="$(get_cloud_vendor)"
         case "$vendor" in
         aws | gcp | oracle | azure | ibm) echo $vendor ;;
@@ -4526,7 +4898,7 @@ trans() {
     # 先检查 modloop 是否正常
     # 防止格式化硬盘后，缺少 ext4 模块导致 mount 失败
     # https://github.com/bin456789/reinstall/issues/136
-    ensure_modloop_started
+    ensure_service_started modloop
 
     cat /proc/cmdline
     clear_previous
@@ -4587,6 +4959,11 @@ trans() {
         case "$img_type" in
         raw)
             dd_gzip_xz_raw
+            if false; then
+                # linux 扩容后无法轻易缩小，例如 xfs
+                # windows 扩容在 windows 下完成
+                resize_after_install_cloud_image
+            fi
             modify_os_on_disk windows
             ;;
         qemu) # dd qemu 不可能到这里，因为上面已处理
@@ -4661,6 +5038,8 @@ if [ "$1" = "update" ]; then
 elif [ "$1" = "alpine" ]; then
     info 'switch to alpine'
     distro=alpine
+    # 后面的步骤很多都会用到这个，例如分区布局
+    cloud_image=0
 fi
 
 # 无参数运行部分
@@ -4692,15 +5071,15 @@ fi
 case 1 in
 1)
     # ChatGPT 说这种性能最高
-    exec > >(exec tee -a $(get_ttys /dev/) /reinstall.log) 2>&1
+    exec > >(exec tee $(get_ttys /dev/) /reinstall.log) 2>&1
     trans
     ;;
 2)
-    exec > >(tee -a $(get_ttys /dev/) /reinstall.log) 2>&1
+    exec > >(tee $(get_ttys /dev/) /reinstall.log) 2>&1
     trans
     ;;
 3)
-    trans 2>&1 | tee -a $(get_ttys /dev/) /reinstall.log
+    trans 2>&1 | tee $(get_ttys /dev/) /reinstall.log
     ;;
 esac
 
